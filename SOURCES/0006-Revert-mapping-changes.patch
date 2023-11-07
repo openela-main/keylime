@@ -1,0 +1,43 @@
+From ed213b9533535ceae5026b2fab274f80bcc58cb8 Mon Sep 17 00:00:00 2001
+From: rpm-build <rpm-build>
+Date: Tue, 15 Aug 2023 09:18:32 -0400
+Subject: [PATCH 6/6] Revert mapping changes
+
+---
+ templates/2.0/mapping.json | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/templates/2.0/mapping.json b/templates/2.0/mapping.json
+index 66addbc..0036b63 100644
+--- a/templates/2.0/mapping.json
++++ b/templates/2.0/mapping.json
+@@ -207,7 +207,7 @@
+             "registrar_port": {
+                 "section": "cloud_verifier",
+                 "option": "registrar_port",
+-                "default": "8881"
++                "default": "8891"
+             },
+             "tls_dir": {
+                 "section": "cloud_verifier",
+@@ -232,7 +232,7 @@
+             "server_key_password": {
+                 "section": "cloud_verifier",
+                 "option": "private_key_pw",
+-                "default": ""
++                "default": "default"
+             },
+             "enable_agent_mtls": {
+                 "section": "cloud_verifier",
+@@ -558,7 +558,7 @@
+             "server_key_password": {
+                 "section": "registrar",
+                 "option": "private_key_pw",
+-                "default": ""
++                "default": "default"
+             },
+             "server_cert": {
+                 "section": "registrar",
+-- 
+2.39.3
+

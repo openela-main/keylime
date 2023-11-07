@@ -1,0 +1,31 @@
+From aa891f456d5cf0fc23e16d87fb28efc79a0d8073 Mon Sep 17 00:00:00 2001
+From: Marcio Silva <marcio.a.silva@ibm.com>
+Date: Wed, 23 Aug 2023 11:24:59 -0300
+Subject: [PATCH 8/8] verifier: should read parameters from verifier.conf only
+
+Single-line fix for #1446
+
+The verifier should read "durable attestation" backend imports from
+verifier.conf (and NOT from registrar.conf)
+
+Signed-off-by: Marcio Silva <marcio.a.silva@ibm.com>
+---
+ keylime/cloud_verifier_tornado.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/keylime/cloud_verifier_tornado.py b/keylime/cloud_verifier_tornado.py
+index d65cb63..261022a 100644
+--- a/keylime/cloud_verifier_tornado.py
++++ b/keylime/cloud_verifier_tornado.py
+@@ -51,7 +51,7 @@ except SQLAlchemyError as err:
+     sys.exit(1)
+ 
+ try:
+-    rmc = record.get_record_mgt_class(config.get("registrar", "durable_attestation_import", fallback=""))
++    rmc = record.get_record_mgt_class(config.get("verifier", "durable_attestation_import", fallback=""))
+     if rmc:
+         rmc = rmc("verifier")
+ except record.RecordManagementException as rme:
+-- 
+2.41.0
+

@@ -1,0 +1,51 @@
+From b8e26ca5e98e1b842db2fc21411962d40f27c557 Mon Sep 17 00:00:00 2001
+From: rpm-build <rpm-build>
+Date: Tue, 15 Aug 2023 07:19:28 -0400
+Subject: [PATCH 3/4] Use version 2.0 as the minimum for the configuration
+
+---
+ keylime/cmd/convert_config.py | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/keylime/cmd/convert_config.py b/keylime/cmd/convert_config.py
+index ac28151..1d71b99 100755
+--- a/keylime/cmd/convert_config.py
++++ b/keylime/cmd/convert_config.py
+@@ -191,7 +191,13 @@ def output(components: List[str], config: RawConfigParser, templates: str, outdi
+ 
+     # Check that there are templates for all components
+     for component in components:
+-        version = config[component]["version"].strip('" ')
++        # Minimum version.
++        version = '2.0'
++        if "version" in config[component]:
++            version = config[component]["version"].strip('" ')
++        else:
++            config[component]["version"] = version
++
+         version_dir = os.path.join(templates, version)
+         if not os.path.isdir(version_dir):
+             raise Exception(f"Could not find directory {version_dir}")
+@@ -292,15 +298,15 @@ def process_mapping(
+                     raise Exception("Invalid version number found in old configuration")
+ 
+             except (configparser.NoOptionError, configparser.NoSectionError):
+-                print(f"No version found in old configuration for {component}, using '1.0'")
+-                old_version = (1, 0)
++                print(f"No version found in old configuration for {component}, using '2.0'")
++                old_version = (2, 0)
+         else:
+             # If the old_version does not contain the component from the
+             # mapping, use the minimum version to use defaults
+-            old_version = (1, 0)
++            old_version = (2, 0)
+ 
+         # Skip versions lower than the current version
+-        if old_version >= new_version:
++        if old_version >= new_version and component in old_config:
+             new[component] = old_config[component]
+             continue
+ 
+-- 
+2.39.3
+

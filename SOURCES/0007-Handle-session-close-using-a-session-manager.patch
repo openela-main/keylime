@@ -1,0 +1,90 @@
+From 3dc40e8b1878d84045ee80cb6d216348713c048a Mon Sep 17 00:00:00 2001
+From: Karel Srot <ksrot@redhat.com>
+Date: Tue, 15 Aug 2023 10:00:50 +0200
+Subject: [PATCH 7/7] Handle session close using a session manager
+
+Resolves https://github.com/keylime/keylime/issues/1455
+
+Signed-off-by: Karel Srot <ksrot@redhat.com>
+---
+ keylime/revocation_notifier.py | 50 +++++++++++++++++-----------------
+ packit-ci.fmf                  |  1 +
+ 2 files changed, 26 insertions(+), 25 deletions(-)
+
+diff --git a/keylime/revocation_notifier.py b/keylime/revocation_notifier.py
+index 31a3095..5cc8b1a 100644
+--- a/keylime/revocation_notifier.py
++++ b/keylime/revocation_notifier.py
+@@ -132,32 +132,32 @@ def notify_webhook(tosend: Dict[str, Any]) -> None:
+     def worker_webhook(tosend: Dict[str, Any], url: str) -> None:
+         interval = config.getfloat("verifier", "retry_interval")
+         exponential_backoff = config.getboolean("verifier", "exponential_backoff")
+-        session = requests.session()
+-        logger.info("Sending revocation event via webhook...")
+-        for i in range(config.getint("verifier", "max_retries")):
+-            next_retry = retry.retry_time(exponential_backoff, interval, i, logger)
+-            try:
+-                response = session.post(url, json=tosend, timeout=5)
+-                if response.status_code in [200, 202]:
+-                    break
+-
+-                logger.debug(
+-                    "Unable to publish revocation message %d times via webhook, "
+-                    "trying again in %d seconds. "
+-                    "Server returned status code: %s",
+-                    i,
+-                    next_retry,
+-                    response.status_code,
+-                )
+-            except requests.exceptions.RequestException as e:
+-                logger.debug(
+-                    "Unable to publish revocation message %d times via webhook, trying again in %d seconds: %s",
+-                    i,
+-                    next_retry,
+-                    e,
+-                )
++        with requests.Session() as session:
++            logger.info("Sending revocation event via webhook...")
++            for i in range(config.getint("verifier", "max_retries")):
++                next_retry = retry.retry_time(exponential_backoff, interval, i, logger)
++                try:
++                    response = session.post(url, json=tosend, timeout=5)
++                    if response.status_code in [200, 202]:
++                        break
++
++                    logger.debug(
++                        "Unable to publish revocation message %d times via webhook, "
++                        "trying again in %d seconds. "
++                        "Server returned status code: %s",
++                        i,
++                        next_retry,
++                        response.status_code,
++                    )
++                except requests.exceptions.RequestException as e:
++                    logger.debug(
++                        "Unable to publish revocation message %d times via webhook, trying again in %d seconds: %s",
++                        i,
++                        next_retry,
++                        e,
++                    )
+ 
+-            time.sleep(next_retry)
++                time.sleep(next_retry)
+ 
+     w = functools.partial(worker_webhook, tosend, url)
+     t = threading.Thread(target=w, daemon=True)
+diff --git a/packit-ci.fmf b/packit-ci.fmf
+index f4d2dae..7abe313 100644
+--- a/packit-ci.fmf
++++ b/packit-ci.fmf
+@@ -108,6 +108,7 @@ adjust:
+      - /setup/configure_tpm_emulator
+      - /setup/install_upstream_keylime
+      - /setup/install_rust_keylime_from_copr
++     - /setup/configure_kernel_ima_module/ima_policy_simple
+      - /functional/basic-attestation-on-localhost
+      - /functional/basic-attestation-with-custom-certificates
+      - /functional/basic-attestation-without-mtls
+-- 
+2.41.0
+

@@ -1,0 +1,88 @@
+From dbd521e8e8f0ffd9ace79c7b9b888f4cb89488f9 Mon Sep 17 00:00:00 2001
+From: rpm-build <rpm-build>
+Date: Tue, 15 Aug 2023 06:09:37 -0400
+Subject: [PATCH 4/4] Duplicate str_to_version for the upgrade tool
+
+So it does not depend on python-keylime
+---
+ keylime/cmd/convert_config.py | 24 ++++++++++++++++++++++--
+ templates/2.0/adjust.py       | 22 ++++++++++++++++++++--
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/keylime/cmd/convert_config.py b/keylime/cmd/convert_config.py
+index c1c6180..cad5e31 100755
+--- a/keylime/cmd/convert_config.py
++++ b/keylime/cmd/convert_config.py
+@@ -84,13 +84,33 @@ import importlib.util
+ import itertools
+ import json
+ import os
++import re
+ import shutil
+ from configparser import RawConfigParser
+-from typing import List, Optional, Tuple
++from typing import List, Optional, Tuple, Union
+ 
+ from jinja2 import Template
+ 
+-from keylime.common.version import str_to_version
++
++def str_to_version(v_str: str) -> Union[Tuple[int, int], None]:
++    """
++    Validates the string format and converts the provided string to a tuple of
++    ints which can be sorted and compared.
++
++    :returns: Tuple with version number parts converted to int. In case of
++    invalid version string, returns None
++    """
++
++    # Strip to remove eventual quotes and spaces
++    v_str = v_str.strip('" ')
++
++    m = re.match(r"^(\d+)\.(\d+)$", v_str)
++
++    if not m:
++        return None
++
++    return (int(m.group(1)), int(m.group(2)))
++
+ 
+ COMPONENTS = ["agent", "verifier", "tenant", "registrar", "ca", "logging"]
+ 
+diff --git a/templates/2.0/adjust.py b/templates/2.0/adjust.py
+index 312b790..c1e582a 100644
+--- a/templates/2.0/adjust.py
++++ b/templates/2.0/adjust.py
+@@ -2,9 +2,27 @@ import ast
+ import configparser
+ import re
+ from configparser import RawConfigParser
+-from typing import Dict, List, Optional, Tuple
++from typing import Dict, List, Optional, Tuple, Union
+ 
+-from keylime.common.version import str_to_version
++
++def str_to_version(v_str: str) -> Union[Tuple[int, int], None]:
++    """
++    Validates the string format and converts the provided string to a tuple of
++    ints which can be sorted and compared.
++
++    :returns: Tuple with version number parts converted to int. In case of
++    invalid version string, returns None
++    """
++
++    # Strip to remove eventual quotes and spaces
++    v_str = v_str.strip('" ')
++
++    m = re.match(r"^(\d+)\.(\d+)$", v_str)
++
++    if not m:
++        return None
++
++    return (int(m.group(1)), int(m.group(2)))
+ 
+ 
+ def adjust(config: RawConfigParser, mapping: Dict) -> None:  # pylint: disable=unused-argument
+-- 
+2.39.3
+

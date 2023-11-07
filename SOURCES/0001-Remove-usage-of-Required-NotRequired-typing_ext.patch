@@ -1,0 +1,104 @@
+Subject: [PATCH] Remove usage of Required/NotRequired typing_ext
+
+Since we do not yet have typing_extensions packaged, let us not
+use its functionality yet.
+---
+ keylime/ima/types.py        | 33 ++++++++++++++-------------------
+ keylime/registrar_client.py |  8 +-------
+ 2 files changed, 15 insertions(+), 26 deletions(-)
+
+diff --git a/keylime/ima/types.py b/keylime/ima/types.py
+index 99f0aa7..a0fffdf 100644
+--- a/keylime/ima/types.py
++++ b/keylime/ima/types.py
+@@ -6,11 +6,6 @@ if sys.version_info >= (3, 8):
+ else:
+     from typing_extensions import Literal, TypedDict
+ 
+-if sys.version_info >= (3, 11):
+-    from typing import NotRequired, Required
+-else:
+-    from typing_extensions import NotRequired, Required
+-
+ ### Types for tpm_dm.py
+ 
+ RuleAttributeType = Optional[Union[int, str, bool]]
+@@ -51,7 +46,7 @@ class Rule(TypedDict):
+ 
+ 
+ class Policies(TypedDict):
+-    version: Required[int]
++    version: int
+     match_on: MatchKeyType
+     rules: Dict[str, Rule]
+ 
+@@ -60,27 +55,27 @@ class Policies(TypedDict):
+ 
+ 
+ class RPMetaType(TypedDict):
+-    version: Required[int]
+-    generator: NotRequired[int]
+-    timestamp: NotRequired[str]
++    version: int
++    generator: int
++    timestamp: str
+ 
+ 
+ class RPImaType(TypedDict):
+-    ignored_keyrings: Required[List[str]]
+-    log_hash_alg: Required[Literal["sha1", "sha256", "sha384", "sha512"]]
++    ignored_keyrings: List[str]
++    log_hash_alg: Literal["sha1", "sha256", "sha384", "sha512"]
+     dm_policy: Optional[Policies]
+ 
+ 
+ RuntimePolicyType = TypedDict(
+     "RuntimePolicyType",
+     {
+-        "meta": Required[RPMetaType],
+-        "release": NotRequired[int],
+-        "digests": Required[Dict[str, List[str]]],
+-        "excludes": Required[List[str]],
+-        "keyrings": Required[Dict[str, List[str]]],
+-        "ima": Required[RPImaType],
+-        "ima-buf": Required[Dict[str, List[str]]],
+-        "verification-keys": Required[str],
++        "meta": RPMetaType,
++        "release": int,
++        "digests": Dict[str, List[str]],
++        "excludes": List[str],
++        "keyrings": Dict[str, List[str]],
++        "ima": RPImaType,
++        "ima-buf": Dict[str, List[str]],
++        "verification-keys": str,
+     },
+ )
+diff --git a/keylime/registrar_client.py b/keylime/registrar_client.py
+index ab28977..ea5341b 100644
+--- a/keylime/registrar_client.py
++++ b/keylime/registrar_client.py
+@@ -13,12 +13,6 @@ if sys.version_info >= (3, 8):
+ else:
+     from typing_extensions import TypedDict
+ 
+-if sys.version_info >= (3, 11):
+-    from typing import NotRequired
+-else:
+-    from typing_extensions import NotRequired
+-
+-
+ class RegistrarData(TypedDict):
+     ip: Optional[str]
+     port: Optional[str]
+@@ -27,7 +21,7 @@ class RegistrarData(TypedDict):
+     aik_tpm: str
+     ek_tpm: str
+     ekcert: Optional[str]
+-    provider_keys: NotRequired[Dict[str, str]]
++    provider_keys: Dict[str, str]
+ 
+ 
+ logger = keylime_logging.init_logging("registrar_client")
+-- 
+2.41.0
+
