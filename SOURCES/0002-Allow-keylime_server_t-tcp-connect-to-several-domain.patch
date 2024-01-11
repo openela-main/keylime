@@ -1,0 +1,27 @@
+From e8a1fa55ff0892ee2380e832ac94abc629b401d6 Mon Sep 17 00:00:00 2001
+From: Patrik Koncity <pkoncity@redhat.com>
+Date: Thu, 10 Aug 2023 07:47:04 -0400
+Subject: [PATCH 2/2] Allow keylime_server_t tcp connect to several domains
+
+---
+ keylime-selinux-1.2.0/keylime.te | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/keylime-selinux-1.2.0/keylime.te b/keylime-selinux-1.2.0/keylime.te
+index 8d47d26..8e6487b 100644
+--- a/keylime-selinux-1.2.0/keylime.te
++++ b/keylime-selinux-1.2.0/keylime.te
+@@ -83,6 +83,10 @@ allow keylime_server_t self:udp_socket create_stream_socket_perms;
+ manage_dirs_pattern(keylime_server_t, keylime_log_t, keylime_log_t)
+ manage_files_pattern(keylime_server_t, keylime_log_t, keylime_log_t)
+ 
++corenet_tcp_connect_http_cache_port(keylime_server_t)
++corenet_tcp_connect_mysqld_port(keylime_server_t)
++corenet_tcp_connect_postgresql_port(keylime_server_t)
++
+ fs_getattr_all_fs(keylime_server_t)
+ fs_rw_inherited_tmpfs_files(keylime_server_t)
+ 
+-- 
+2.39.3
+

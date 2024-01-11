@@ -1,0 +1,59 @@
+--- a/scripts/create_runtime_policy.sh	2023-10-09 17:04:26.121194607 +0200
++++ b/scripts/create_runtime_policy.sh	2023-10-09 17:06:02.089855614 +0200
+@@ -42,7 +42,7 @@
+     exit $NOARGS;
+ fi
+ 
+-ALGO=sha1sum
++ALGO=sha256sum
+ 
+ ALGO_LIST=("sha1sum" "sha256sum" "sha512sum")
+ 
+@@ -78,7 +78,7 @@
+ 
+ 
+ # Where to look for initramfs image
+-INITRAMFS_LOC="/boot/"
++INITRAMFS_LOC="/boot"
+ if [ -d "/ostree" ]; then
+     # If we are on an ostree system change where we look for initramfs image
+     loc=$(grep -E "/ostree/[^/]([^/]*)" -o /proc/cmdline | head -n 1 | cut -d / -f 3)
+@@ -121,7 +121,7 @@
+             cp -r /tmp/ima/$i-extracted-unmk/. /tmp/ima/$i-extracted
+         fi
+     elif [[ -x "/usr/lib/dracut/skipcpio" ]] ; then
+-        /usr/lib/dracut/skipcpio $i | gunzip -c | cpio -i -d 2> /dev/null
++        /usr/lib/dracut/skipcpio $i | gunzip -c 2> /dev/null | cpio -i -d 2> /dev/null
+     else
+         echo "ERROR: No tools for initramfs image processing found!"
+         break
+@@ -130,9 +130,26 @@
+     find -type f -exec $ALGO "./{}" \; | sed "s| \./\./| /|" >> $OUTPUT
+ done
+ 
+-# Convert to runtime policy
+-echo "Converting created allowlist to Keylime runtime policy"
+-python3 $WORKING_DIR/../keylime/cmd/convert_runtime_policy.py -a $OUTPUT -o $OUTPUT
++# when ROOTFS_LOC = '/', the path starts on allowlist ends up with double '//'
++#
++# Example:
++#
++# b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c  //bar
++#
++# Replace the unwanted '//' with a single '/'
++sed -i 's| /\+| /|g'  $ALLOWLIST_DIR/${OUTPUT}
++
++# When the file name contains newlines or backslashes, the output of sha256sum
++# adds a backslash at the beginning of the line.
++#
++# Example:
++#
++# $ echo foo > ba\\r
++# $ sha256sum ba\\r
++# \b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c  ba\\r
++#
++# Remove the unwanted backslash prefix
++sed -i 's/^\\//g' $ALLOWLIST_DIR/${OUTPUT}
+ 
+ # Clean up
+ rm -rf /tmp/ima

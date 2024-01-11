@@ -1,5 +1,5 @@
 %global srcname keylime
-%global policy_version 1.0.0
+%global policy_version 1.2.0
 %global with_selinux 1
 %global selinuxtype targeted
 
@@ -8,8 +8,8 @@
 %global debug_package %{nil}
 
 Name:    keylime
-Version: 6.5.2
-Release: 6%{?dist}
+Version: 7.3.0
+Release: 12%{?dist}
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -17,11 +17,19 @@ Source0:        https://github.com/keylime/keylime/archive/refs/tags/v%{version}
 Source1:        %{srcname}.sysusers
 Source2:        https://github.com/RedHat-SP-Security/%{name}-selinux/archive/v%{policy_version}/keylime-selinux-%{policy_version}.tar.gz
 
-Patch: 0001-Do-not-use-default-values-that-need-reading-the-conf.patch
-Patch: 0002-Switch-to-sha256-hashes-for-signatures.patch
-Patch: 0003-logging-remove-option-to-log-into-separate-file.patch
-Patch: 0004-CVE-2023-38200.patch
-Patch: 0005-CVE-2023-38201.patch
+Patch: 0001-Remove-usage-of-Required-NotRequired-typing_ext.patch
+Patch: 0002-Allow-keylime_server_t-tcp-connect-to-several-domain.patch
+Patch: 0003-Use-version-2.0-as-the-minimum-for-the-configuration.patch
+Patch: 0004-Duplicate-str_to_version-for-the-upgrade-tool.patch
+Patch: 0005-elchecking-example-add-ignores-for-EV_PLATFORM_CONFI.patch
+Patch: 0006-Revert-mapping-changes.patch
+Patch: 0007-Handle-session-close-using-a-session-manager.patch
+Patch: 0008-verifier-should-read-parameters-from-verifier.conf-o.patch
+Patch: 0009-CVE-2023-38201.patch
+Patch: 0010-CVE-2023-38200.patch
+Patch: 0011-Automatically-update-agent-API-version.patch
+Patch: 0012-Restore-create-allowlist.patch
+Patch: 0013-Set-generator-and-timestamp-in-create-policy.patch
 
 License: ASL 2.0 and MIT
 
@@ -33,6 +41,7 @@ BuildRequires: python3-dbus
 BuildRequires: python3-jinja2
 BuildRequires: python3-setuptools
 BuildRequires: systemd-rpm-macros
+BuildRequires: tpm2-abrmd-selinux
 
 Requires: python3-%{srcname} = %{version}-%{release}
 Requires: %{srcname}-base = %{version}-%{release}
@@ -54,7 +63,9 @@ Summary: The base package contains the default configuration
 License: MIT
 
 
+Requires(pre): python3-jinja2
 Requires(pre): shadow-utils
+Requires(pre): util-linux
 Requires: procps-ng
 Requires: tpm2-tss
 
@@ -90,6 +101,7 @@ Requires: python3-gpg
 Requires: python3-lark-parser
 Requires: python3-pyasn1
 Requires: python3-pyasn1-modules
+Requires: python3-jsonschema
 Requires: tpm2-tools
 Requires: openssl
 
@@ -171,32 +183,31 @@ for comp in "verifier" "tenant" "registrar" "ca" "logging"; do
     install -Dpm 400 config/${comp}.conf %{buildroot}/%{_sysconfdir}/%{srcname}
 done
 
-# Remove agent.
-rm -f %{buildroot}/%{_bindir}/%{srcname}_agent
-rm -f %{buildroot}%{python3_sitelib}/%{srcname}/__pycache__/%{srcname}_agent*
-rm -f %{buildroot}%{python3_sitelib}/%{srcname}/cmd/__pycache__/agent.*
-rm -f %{buildroot}%{python3_sitelib}/%{srcname}/cmd/agent.*
-rm -f %{buildroot}%{python3_sitelib}/%{srcname}/%{srcname}_agent.*
-
-# Remove misc progs.
-rm -f %{buildroot}/%{_bindir}/%{srcname}_ima_emulator
-rm -f %{buildroot}/%{_bindir}/%{srcname}_userdata_encrypt
-
 # Ship some scripts.
 mkdir -p %{buildroot}/%{_datadir}/%{srcname}/scripts
-for s in create_allowlist.sh \
-         create_mb_refstate \
-         create_policy \
+for s in create_mb_refstate \
          ek-openssl-verify; do
     install -Dpm 755 scripts/${s} \
         %{buildroot}/%{_datadir}/%{srcname}/scripts/${s}
 done
 
+# On RHEL 9.3, install create_runtime_policy.sh as create_allowlist.sh
+# The convert_runtime_policy.py script to convert allowlist and excludelist into
+# runtime policy is not called anymore.
+# See: https://issues.redhat.com/browse/RHEL-11866
+install -Dpm 755 scripts/create_runtime_policy.sh \
+        %{buildroot}/%{_datadir}/%{srcname}/scripts/create_allowlist.sh
+
+# Ship configuration templates.
+cp -r ./templates %{buildroot}%{_datadir}/%{srcname}/templates/
+
+mkdir -p --mode=0755 %{buildroot}/%{_bindir}
+install -Dpm 755 ./keylime/cmd/convert_config.py %{buildroot}/%{_bindir}/keylime_upgrade_config
+
 %if 0%{?with_selinux}
 install -D -m 0644 %{srcname}.pp.bz2 %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{srcname}.pp.bz2
 install -D -p -m 0644 keylime-selinux-%{policy_version}/%{srcname}.if %{buildroot}%{_datadir}/selinux/devel/include/distributed/%{srcname}.if
 %endif
-
 
 install -Dpm 644 ./services/%{srcname}_verifier.service \
     %{buildroot}%{_unitdir}/%{srcname}_verifier.service
@@ -218,6 +229,10 @@ install -p -D -m 0644 %{SOURCE1} %{buildroot}%{_sysusersdir}/%{srcname}.conf
 %sysusers_create_compat %{SOURCE1}
 exit 0
 
+%post base
+/usr/bin/keylime_upgrade_config --component ca --component logging >/dev/null
+exit 0
+
 %posttrans base
 if [ -d %{_sysconfdir}/%{srcname} ]; then
     chmod 500 %{_sysconfdir}/%{srcname}
@@ -228,7 +243,6 @@ if [ -d %{_sysconfdir}/%{srcname} ]; then
             chmod 500 %{_sysconfdir}/%{srcname}/${comp}.conf.d
     done
 fi
-
 
 [ -d %{_sharedstatedir}/%{srcname} ] && \
     chown -R %{srcname} %{_sharedstatedir}/%{srcname}/
@@ -242,10 +256,18 @@ fi
 exit 0
 
 %post verifier
+/usr/bin/keylime_upgrade_config --component verifier >/dev/null
 %systemd_post %{srcname}_verifier.service
+exit 0
 
 %post registrar
+/usr/bin/keylime_upgrade_config --component registrar >/dev/null
 %systemd_post %{srcname}_registrar.service
+exit 0
+
+%post tenant
+/usr/bin/keylime_upgrade_config --component tenant >/dev/null
+exit 0
 
 %preun verifier
 %systemd_preun %{srcname}_verifier.service
@@ -290,16 +312,15 @@ fi
 %files verifier
 %license LICENSE
 %attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}/verifier.conf.d
-%config(noreplace) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/verifier.conf
+%config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/verifier.conf
 %{_bindir}/%{srcname}_verifier
 %{_bindir}/%{srcname}_ca
-%{_bindir}/%{srcname}_migrations_apply
 %{_unitdir}/keylime_verifier.service
 
 %files registrar
 %license LICENSE
 %attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}/registrar.conf.d
-%config(noreplace) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/registrar.conf
+%config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/registrar.conf
 %{_bindir}/%{srcname}_registrar
 %{_unitdir}/keylime_registrar.service
 
@@ -313,7 +334,7 @@ fi
 %files tenant
 %license LICENSE
 %attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}/tenant.conf.d
-%config(noreplace) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/tenant.conf
+%config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/tenant.conf
 %{_bindir}/%{srcname}_tenant
 
 %files -n python3-%{srcname}
@@ -321,15 +342,18 @@ fi
 %{python3_sitelib}/%{srcname}-*.egg-info/
 %{python3_sitelib}/%{srcname}
 %{_datadir}/%{srcname}/scripts/create_mb_refstate
-%{_datadir}/%{srcname}/scripts/create_policy
-%{_bindir}/keylime_convert_ima_policy
+%{_bindir}/keylime_attest
+%{_bindir}/keylime_convert_runtime_policy
+%{_bindir}/keylime_create_policy
+%{_bindir}/keylime_sign_runtime_policy
+%{_bindir}/keylime_userdata_encrypt
 
 %files base
 %license LICENSE
 %doc README.md
 %attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}/{ca,logging}.conf.d
-%config(noreplace) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/ca.conf
-%config(noreplace) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/logging.conf
+%config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/ca.conf
+%config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/logging.conf
 %attr(700,%{srcname},%{srcname}) %dir %{_rundir}/%{srcname}
 %attr(700,%{srcname},%{srcname}) %dir %{_localstatedir}/log/%{srcname}
 %attr(700,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}
@@ -339,18 +363,70 @@ fi
 %{_sysusersdir}/%{srcname}.conf
 %{_datadir}/%{srcname}/scripts/create_allowlist.sh
 %{_datadir}/%{srcname}/scripts/ek-openssl-verify
+%{_datadir}/%{srcname}/templates
+%{_bindir}/keylime_upgrade_config
 
 %files
 %license LICENSE
 
 %changelog
-* Thu Aug 24 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 6.5.2-6
-- Fix challenge-protocol bypass during agent registration (CVE-2023-38201)
-  Resolves: rhbz#2234463
+* Tue Oct 17 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.3.0-12
+- Set the generator and timestamp in create_policy.py
+  Related: RHEL-11866
 
-* Fri Jul 21 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 6.5.2-5
-- Fix possible DOS on registrar (CVE-2023-38200)
-  Resolves: rhbz#2228048
+* Mon Oct 09 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.3.0-11
+- Suppress unnecessary error message
+  Related: RHEL-11866
+
+* Fri Oct 06 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.3.0-10
+- Restore allowlist generation script
+  Resolves: RHEL-11866
+  Resolves: RHEL-11867
+
+* Wed Sep 06 2023 Sergio Correia <scorreia@redhat.com> - 7.3.0-9
+- Rebuild for properly tagging the resulting build
+  Resolves: RHEL-1898
+
+* Fri Sep 01 2023 Sergio Correia <scorreia@redhat.com> - 7.3.0-8
+- Add missing dependencies python3-jinja2 and util-linux
+  Resolves: RHEL-1898
+
+* Mon Aug 28 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.3.0-7
+- Automatically update agent API version
+  Resolves: RHEL-1518
+
+* Mon Aug 28 2023 Sergio Correia <scorreia@redhat.com> - 7.3.0-6
+- Fix registrar is subject to a DoS against SSL (CVE-2023-38200)
+  Resolves: rhbz#2222694
+
+* Fri Aug 25 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.3.0-5
+- Fix challenge-protocol bypass during agent registration (CVE-2023-38201)
+  Resolves: rhbz#2222695
+
+* Tue Aug 22 2023 Sergio Correia <scorreia@redhat.com> - 7.3.0-4
+- Update spec file to use %verify(not md5 size mode mtime) for files updated in %post scriptlets
+  Resolves: RHEL-475
+
+* Tue Aug 15 2023 Sergio Correia <scorreia@redhat.com> - 7.3.0-3
+- Fix Keylime configuration upgrades issues introduced in last rebase
+  Resolves: RHEL-475
+- Handle session close using a session manager
+  Resolves: RHEL-1252
+- Add ignores for EV_PLATFORM_CONFIG_FLAGS
+  Resolves: RHEL-947
+
+* Tue Aug 8 2023 Patrik Koncity <pkoncity@redhat.com> - 7.3.0-2
+- Keylime SELinux policy provides more restricted ports.
+- New SELinux label for ports used by keylime.
+- Adding tabrmd interfaces allow unix stream socket communication and dbus communication.
+- Allow the keylime_server_t domain to get the attributes of all filesystems.
+  Resolves: RHEL-595
+  Resolves: RHEL-390
+  Resolves: RHEL-948
+
+* Wed Jul 19 2023 Sergio Correia <scorreia@redhat.com> - 7.3.0-1
+- Update to 7.3.0
+  Resolves: RHEL-475
 
 * Fri Jan 13 2023 Sergio Correia <scorreia@redhat.com> - 6.5.2-4
 - Backport upstream PR#1240 - logging: remove option to log into separate file
