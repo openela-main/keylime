@@ -9,7 +9,7 @@
 
 Name:    keylime
 Version: 7.3.0
-Release: 12%{?dist}
+Release: 13%{?dist}
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -30,6 +30,7 @@ Patch: 0010-CVE-2023-38200.patch
 Patch: 0011-Automatically-update-agent-API-version.patch
 Patch: 0012-Restore-create-allowlist.patch
 Patch: 0013-Set-generator-and-timestamp-in-create-policy.patch
+Patch: 0014-tpm_util-Replace-a-logger.error-with-an-Exception-in.patch
 
 License: ASL 2.0 and MIT
 
@@ -370,6 +371,10 @@ fi
 %license LICENSE
 
 %changelog
+* Fri Jan 05 2024 Sergio Correia <scorreia@redhat.com> - 7.3.0-13
+- Backport fix for CVE-2023-3674
+  Resolves: RHEL-21013
+
 * Tue Oct 17 2023 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.3.0-12
 - Set the generator and timestamp in create_policy.py
   Related: RHEL-11866

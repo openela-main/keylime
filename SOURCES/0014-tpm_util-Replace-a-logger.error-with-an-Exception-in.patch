@@ -1,0 +1,80 @@
+From add9847988e963fd124863736592fc16cc8c716b Mon Sep 17 00:00:00 2001
+From: Stefan Berger <stefanb@linux.ibm.com>
+Date: Tue, 11 Jul 2023 18:03:28 -0400
+Subject: [PATCH 14/14] tpm_util: Replace a logger.error with an Exception in
+ case of invalid signature
+
+This fixes a possibly severe issue in 7.2.5 & 7.3.0.
+
+Signed-off-by: Stefan Berger <stefanb@linux.ibm.com>
+---
+ keylime/tpm/tpm_util.py      |  6 +-----
+ keylime/tpm/tpm_util_test.py | 21 +++++++++++++++++++++
+ 2 files changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/keylime/tpm/tpm_util.py b/keylime/tpm/tpm_util.py
+index ce2ce0f..58a1a04 100644
+--- a/keylime/tpm/tpm_util.py
++++ b/keylime/tpm/tpm_util.py
+@@ -3,7 +3,6 @@ import string
+ import struct
+ from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+-from cryptography.exceptions import InvalidSignature
+ from cryptography.hazmat import backends
+ from cryptography.hazmat.primitives import hashes, hmac, serialization
+ from cryptography.hazmat.primitives.asymmetric import ec, padding
+@@ -155,10 +154,7 @@ def checkquote(
+     digest.update(quoteblob)
+     quote_digest = digest.finalize()
+ 
+-    try:
+-        verify(pubkey, signature, quote_digest, hashfunc)
+-    except InvalidSignature:
+-        logger.error("Invalid quote signature!")
++    verify(pubkey, signature, quote_digest, hashfunc)
+ 
+     # Check that reported nonce is expected one
+     retDict = tpm2_objects.unmarshal_tpms_attest(quoteblob)
+diff --git a/keylime/tpm/tpm_util_test.py b/keylime/tpm/tpm_util_test.py
+index aaf16cd..2c73997 100644
+--- a/keylime/tpm/tpm_util_test.py
++++ b/keylime/tpm/tpm_util_test.py
+@@ -2,6 +2,7 @@ import base64
+ import unittest
+ from unittest import mock
+ 
++from cryptography.exceptions import InvalidSignature
+ from cryptography.hazmat.primitives.asymmetric.ec import (
+     SECP256R1,
+     EllipticCurve,
+@@ -60,6 +61,26 @@ class TestTpmUtil(unittest.TestCase):
+         except Exception as e:
+             self.fail(f"checkquote failed with {e}")
+ 
++        # test bad input
++        bad_quoteblob = bytearray(quoteblob)
++        bad_quoteblob[5] ^= 0x1
++        with self.assertRaises(InvalidSignature):
++            checkquote(aikblob, nonce, sigblob, bad_quoteblob, pcrblob, "sha256")
++
++        l = list(nonce)
++        l[0] = "a"
++        bad_nonce = "".join(l)
++        with self.assertRaises(Exception):
++            checkquote(aikblob, bad_nonce, sigblob, quoteblob, pcrblob, "sha256")
++
++        bad_pcrblob = bytearray(pcrblob)
++        bad_pcrblob[5] ^= 0x1
++        with self.assertRaises(Exception):
++            checkquote(aikblob, nonce, sigblob, quoteblob, bad_pcrblob, "sha256")
++
++        with self.assertRaises(ValueError):
++            checkquote(aikblob, nonce, sigblob, quoteblob, pcrblob, "sha1")
++
+     @staticmethod
+     def not_random(numbytes: int) -> bytes:
+         return b"\x12" * numbytes
+-- 
+2.41.0
+
