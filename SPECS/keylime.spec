@@ -9,7 +9,7 @@
 
 Name:    keylime
 Version: 7.3.0
-Release: 13%{?dist}
+Release: 15%{?dist}
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -31,6 +31,8 @@ Patch: 0011-Automatically-update-agent-API-version.patch
 Patch: 0012-Restore-create-allowlist.patch
 Patch: 0013-Set-generator-and-timestamp-in-create-policy.patch
 Patch: 0014-tpm_util-Replace-a-logger.error-with-an-Exception-in.patch
+Patch: 0015-Backport-keylime-policy-tool.patch
+Patch: 0016-Use-TLS-on-revocation-notification-webhook.patch
 
 License: ASL 2.0 and MIT
 
@@ -103,6 +105,7 @@ Requires: python3-lark-parser
 Requires: python3-pyasn1
 Requires: python3-pyasn1-modules
 Requires: python3-jsonschema
+Requires: python3-psutil
 Requires: tpm2-tools
 Requires: openssl
 
@@ -348,6 +351,7 @@ fi
 %{_bindir}/keylime_create_policy
 %{_bindir}/keylime_sign_runtime_policy
 %{_bindir}/keylime_userdata_encrypt
+%{_bindir}/keylime-policy
 
 %files base
 %license LICENSE
@@ -371,6 +375,20 @@ fi
 %license LICENSE
 
 %changelog
+* Wed Feb 05 2025 Sergio Correia <scorreia@redhat.com> - 7.3.0-15
+- Use TLS on revocation notification webhook
+- Include system installed CA certificates when verifying webhook
+   server certificate
+- Include the CA certificates added via configuration file option
+  'trusted_server_ca'
+  Resolves: RHEL-78057
+  Resolves: RHEL-78313
+  Resolves: RHEL-78316
+
+* Fri Jan 10 2025 Sergio Correia <scorreia@redhat.com> - 7.3.0-14
+- Backport keylime-policy tool
+  Resolves: RHEL-75797
+
 * Fri Jan 05 2024 Sergio Correia <scorreia@redhat.com> - 7.3.0-13
 - Backport fix for CVE-2023-3674
   Resolves: RHEL-21013
