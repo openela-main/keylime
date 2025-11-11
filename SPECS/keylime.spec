@@ -1,5 +1,5 @@
 %global srcname keylime
-%global policy_version 1.2.0
+%global policy_version 42.1.2
 %global with_selinux 1
 %global selinuxtype targeted
 
@@ -8,43 +8,59 @@
 %global debug_package %{nil}
 
 Name:    keylime
-Version: 7.3.0
-Release: 15%{?dist}
+Version: 7.12.1
+Release: 11%{?dist}
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
 Source0:        https://github.com/keylime/keylime/archive/refs/tags/v%{version}.tar.gz
-Source1:        %{srcname}.sysusers
-Source2:        https://github.com/RedHat-SP-Security/%{name}-selinux/archive/v%{policy_version}/keylime-selinux-%{policy_version}.tar.gz
+Source1:        https://github.com/RedHat-SP-Security/%{name}-selinux/archive/v%{policy_version}/keylime-selinux-%{policy_version}.tar.gz
+Source2:        %{srcname}.sysusers
+Source3:        %{srcname}.tmpfiles
 
-Patch: 0001-Remove-usage-of-Required-NotRequired-typing_ext.patch
-Patch: 0002-Allow-keylime_server_t-tcp-connect-to-several-domain.patch
-Patch: 0003-Use-version-2.0-as-the-minimum-for-the-configuration.patch
-Patch: 0004-Duplicate-str_to_version-for-the-upgrade-tool.patch
-Patch: 0005-elchecking-example-add-ignores-for-EV_PLATFORM_CONFI.patch
-Patch: 0006-Revert-mapping-changes.patch
-Patch: 0007-Handle-session-close-using-a-session-manager.patch
-Patch: 0008-verifier-should-read-parameters-from-verifier.conf-o.patch
-Patch: 0009-CVE-2023-38201.patch
-Patch: 0010-CVE-2023-38200.patch
-Patch: 0011-Automatically-update-agent-API-version.patch
-Patch: 0012-Restore-create-allowlist.patch
-Patch: 0013-Set-generator-and-timestamp-in-create-policy.patch
-Patch: 0014-tpm_util-Replace-a-logger.error-with-an-Exception-in.patch
-Patch: 0015-Backport-keylime-policy-tool.patch
-Patch: 0016-Use-TLS-on-revocation-notification-webhook.patch
+Patch: 0001-Make-keylime-compatible-with-python-3.9.patch
+Patch: 0002-tests-fix-rpm-repo-tests-from-create-runtime-policy.patch
+Patch: 0003-tests-skip-measured-boot-related-tests-for-s390x-and.patch
+Patch: 0004-templates-duplicate-str_to_version-in-the-adjust-scr.patch
+# RHEL-9 ships a slightly modified version of create_allowlist.sh and
+# also a "default" server_key_password for the registrar and verifier.
+# DO NOT REMOVE THE FOLLOWING TWO PATCHES IN FOLLOWING RHEL-9.x REBASES.
+Patch: 0005-Restore-RHEL-9-version-of-create_allowlist.sh.patch
+Patch: 0006-Revert-default-server_key_password-for-verifier-regi.patch
+# Backported from https://github.com/keylime/keylime/pull/1782
+Patch: 0007-fix_db_connection_leaks.patch
+
+# Backported from https://github.com/keylime/keylime/pull/1791
+Patch: 0008-mb-support-EV_EFI_HANDOFF_TABLES-events-on-PCR1.patch
+Patch: 0009-mb-support-vendor_db-as-logged-by-newer-shim-version.patch
+
+# Backported from https://github.com/keylime/keylime/pull/1784
+# and https://github.com/keylime/keylime/pull/1785.
+Patch: 0010-verifier-Gracefully-shutdown-on-signal.patch
+Patch: 0011-revocations-Try-to-send-notifications-on-shutdown.patch
+Patch: 0012-requests_client-close-the-session-at-the-end-of-the-.patch
 
 License: ASL 2.0 and MIT
 
 BuildRequires: git-core
-BuildRequires: swig
 BuildRequires: openssl-devel
 BuildRequires: python3-devel
 BuildRequires: python3-dbus
 BuildRequires: python3-jinja2
+BuildRequires: python3-cryptography
+BuildRequires: python3-pyasn1
+BuildRequires: python3-pyasn1-modules
+BuildRequires: python3-tornado
+BuildRequires: python3-sqlalchemy
+BuildRequires: python3-lark-parser
+BuildRequires: python3-psutil
+BuildRequires: python3-pyyaml
+BuildRequires: python3-jsonschema
 BuildRequires: python3-setuptools
 BuildRequires: systemd-rpm-macros
-BuildRequires: tpm2-abrmd-selinux
+BuildRequires: rpm-sign
+BuildRequires: createrepo_c
+BuildRequires: tpm2-tools
 
 Requires: python3-%{srcname} = %{version}-%{release}
 Requires: %{srcname}-base = %{version}-%{release}
@@ -69,8 +85,9 @@ License: MIT
 Requires(pre): python3-jinja2
 Requires(pre): shadow-utils
 Requires(pre): util-linux
+Requires(pre): tpm2-tss
 Requires: procps-ng
-Requires: tpm2-tss
+Requires: openssl
 
 %if 0%{?with_selinux}
 # This ensures that the *-selinux package and all it’s dependencies are not pulled
@@ -79,6 +96,7 @@ Recommends:       (%{srcname}-selinux if selinux-policy-%{selinuxtype})
 %endif
 
 %ifarch %efi
+BuildRequires: efivar-libs
 Requires: efivar-libs
 %endif
 
@@ -161,7 +179,7 @@ Requires: python3-%{srcname} = %{version}-%{release}
 The Keylime Tenant can be used to provision a Keylime Agent.
 
 %prep
-%autosetup -S git -n %{srcname}-%{version} -a2
+%autosetup -S git -n %{srcname}-%{version} -a1
 
 %if 0%{?with_selinux}
 # SELinux policy (originally from selinux-policy-contrib)
@@ -179,7 +197,6 @@ bzip2 -9 %{srcname}.pp
 %py3_install
 mkdir -p %{buildroot}/%{_sharedstatedir}/%{srcname}
 mkdir -p --mode=0700 %{buildroot}/%{_rundir}/%{srcname}
-mkdir -p --mode=0700 %{buildroot}/%{_localstatedir}/log/%{srcname}
 
 mkdir -p --mode=0700 %{buildroot}/%{_sysconfdir}/%{srcname}/
 for comp in "verifier" "tenant" "registrar" "ca" "logging"; do
@@ -219,22 +236,55 @@ install -Dpm 644 ./services/%{srcname}_verifier.service \
 install -Dpm 644 ./services/%{srcname}_registrar.service \
     %{buildroot}%{_unitdir}/%{srcname}_registrar.service
 
-cp -r ./tpm_cert_store %{buildroot}%{_sharedstatedir}/%{srcname}/
-chmod 400 %{buildroot}%{_sharedstatedir}/%{srcname}/tpm_cert_store/*.pem
+# TPM cert store is deployed to both /usr/share/keylime/tpm_cert_store
+# and then /var/lib/keylime/tpm_cert_store.
+for cert_store_dir in %{_datadir} %{_sharedstatedir}; do
+    mkdir -p %{buildroot}/"${cert_store_dir}"/%{srcname}
+    cp -r ./tpm_cert_store %{buildroot}/"${cert_store_dir}"/%{srcname}/
+done
 
-install -p -d %{buildroot}/%{_tmpfilesdir}
-cat > %{buildroot}/%{_tmpfilesdir}/%{srcname}.conf << EOF
-d %{_rundir}/%{srcname} 0700 %{srcname} %{srcname} -
-EOF
+# Install the sysusers + tmpfiles.d configuration.
+install -p -D -m 0644 %{SOURCE2} %{buildroot}/%{_sysusersdir}/%{srcname}.conf
+install -p -D -m 0644 %{SOURCE3} %{buildroot}/%{_tmpfilesdir}/%{name}.conf
 
-install -p -D -m 0644 %{SOURCE1} %{buildroot}%{_sysusersdir}/%{srcname}.conf
+%check
+# Create the default configuration files to be used by the tests.
+# Also set the associated environment variables so that the tests
+# will actually use them.
+CONF_TEMP_DIR="$(mktemp -d)"
+
+%{python3} -m keylime.cmd.convert_config --out "${CONF_TEMP_DIR}" --templates templates/
+export KEYLIME_VERIFIER_CONFIG="${CONF_TEMP_DIR}/verifier.conf"
+export KEYLIME_TENANT_CONFIG="${CONF_TEMP_DIR}/tenant.conf"
+export KEYLIME_REGISTRAR_CONFIG="${CONF_TEMP_DIR}/registrar.conf"
+export KEYLIME_CA_CONFIG="${CONF_TEMP_DIR}/ca.conf"
+export KEYLIME_LOGGING_CONFIG="${CONF_TEMP_DIR}/logging.conf"
+
+# Run the tests.
+%{python3} -m unittest
+
+# Cleanup.
+[ "${CONF_TEMP_DIR}" ] && rm -rf "${CONF_TEMP_DIR}"
+for e in KEYLIME_VERIFIER_CONFIG \
+         KEYLIME_TENANT_CONFIG \
+         KEYLIME_REGISTRAR_CONFIG \
+         KEYLIME_CA_CONFIG \
+         KEYLIME_LOGGING_CONFIG; do
+    unset "${e}"
+done
+exit 0
 
 %pre base
-%sysusers_create_compat %{SOURCE1}
+%sysusers_create_compat %{SOURCE2}
 exit 0
 
 %post base
-/usr/bin/keylime_upgrade_config --component ca --component logging >/dev/null
+for c in ca logging; do
+    [ -e /etc/keylime/"${c}.conf" ] || continue
+    /usr/bin/keylime_upgrade_config --component "${c}" \
+                                    --input /etc/keylime/"${c}.conf" \
+                                    >/dev/null
+done
 exit 0
 
 %posttrans base
@@ -254,23 +304,29 @@ fi
 [ -d %{_sharedstatedir}/%{srcname}/tpm_cert_store ] && \
     chmod 400 %{_sharedstatedir}/%{srcname}/tpm_cert_store/*.pem && \
     chmod 500 %{_sharedstatedir}/%{srcname}/tpm_cert_store/
-
-[ -d %{_localstatedir}/log/%{srcname} ] && \
-    chown -R %{srcname} %{_localstatedir}/log/%{srcname}/
 exit 0
 
 %post verifier
-/usr/bin/keylime_upgrade_config --component verifier >/dev/null
+[ -e /etc/keylime/verifier.conf ] && \
+    /usr/bin/keylime_upgrade_config --component verifier \
+                                    --input /etc/keylime/verifier.conf \
+                                    >/dev/null
 %systemd_post %{srcname}_verifier.service
 exit 0
 
 %post registrar
-/usr/bin/keylime_upgrade_config --component registrar >/dev/null
+[ -e /etc/keylime/registrar.conf ] && \
+    /usr/bin/keylime_upgrade_config --component registrar \
+                                    --input /etc/keylime/registrar.conf /
+                                    >/dev/null
 %systemd_post %{srcname}_registrar.service
 exit 0
 
 %post tenant
-/usr/bin/keylime_upgrade_config --component tenant >/dev/null
+[ -e /etc/keylime/tenant.conf ] && \
+    /usr/bin/keylime_upgrade_config --component tenant \
+                                    --input /etc/keylime/tenant.conf \
+                                    >/dev/null
 exit 0
 
 %preun verifier
@@ -356,12 +412,14 @@ fi
 %files base
 %license LICENSE
 %doc README.md
+%attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}
 %attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}/{ca,logging}.conf.d
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/ca.conf
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/logging.conf
 %attr(700,%{srcname},%{srcname}) %dir %{_rundir}/%{srcname}
-%attr(700,%{srcname},%{srcname}) %dir %{_localstatedir}/log/%{srcname}
 %attr(700,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}
+%attr(500,%{srcname},%{srcname}) %dir %{_datadir}/%{srcname}/tpm_cert_store
+%attr(400,%{srcname},%{srcname}) %{_datadir}/%{srcname}/tpm_cert_store/*.pem
 %attr(500,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}/tpm_cert_store
 %attr(400,%{srcname},%{srcname}) %{_sharedstatedir}/%{srcname}/tpm_cert_store/*.pem
 %{_tmpfilesdir}/%{srcname}.conf
@@ -375,6 +433,50 @@ fi
 %license LICENSE
 
 %changelog
+* Mon Aug 18 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-11
+-  Fix for revocation notifier not closing TLS session correctly
+   Resolves: RHEL-109656
+
+* Wed Aug 13 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-10
+- Support vendor_db: follow-up fix
+  Related: RHEL-80455
+
+* Tue Aug 12 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-9
+- Support vendor_db as logged by newer shim versions
+  Resolves: RHEL-80455
+
+* Fri Aug 08 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-8
+- Fix DB connection leaks
+  Resolves: RHEL-108263
+
+* Tue Jul 22 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-7
+- Fix tmpfiles.d configuration related to the cert store
+  Resolves: RHEL-104572
+
+* Thu Jul 10 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-6
+- Populate cert_store_dir with tpmfiles.d
+  Resolves: RHEL-76926
+
+* Thu Jul 10 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-5
+- Use tmpfiles.d for permissions in /var/lib/keylime and /etc/keylime
+  Resolves: RHEL-77144
+
+* Tue Jul 08 2025 Patrik Koncity <pkoncity@redhat.com> - 7.12.1-4
+- Add new keylime-selinux release - removing keylime_var_log_t label
+  Resolves: RHEL-388
+
+* Fri Jun 20 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-3
+- Avoid changing ownership of /var/log/keylime
+  Resolves: RHEL-388
+
+* Tue May 27 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-2
+- Revert changes to default server_key_password for verifier/registrar
+  Resolves: RHEL-93678
+
+* Thu May 22 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-1
+- Update to 7.12.1
+  Resolves: RHEL-78418
+
 * Wed Feb 05 2025 Sergio Correia <scorreia@redhat.com> - 7.3.0-15
 - Use TLS on revocation notification webhook
 - Include system installed CA certificates when verifying webhook

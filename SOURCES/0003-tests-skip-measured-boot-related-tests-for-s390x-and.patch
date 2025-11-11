@@ -1,0 +1,52 @@
+From 4e7cd6b75de27897ecc8e7329732cd945f7adfd0 Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Thu, 22 May 2025 18:27:04 +0100
+Subject: [PATCH 3/6] tests: skip measured-boot related tests for s390x and
+ ppc64le
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ test/test_create_mb_policy.py | 2 ++
+ test/test_mba_parsing.py      | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/test/test_create_mb_policy.py b/test/test_create_mb_policy.py
+index eaed0e3..b00d8e7 100644
+--- a/test/test_create_mb_policy.py
++++ b/test/test_create_mb_policy.py
+@@ -5,6 +5,7 @@ Copyright 2024 Red Hat, Inc.
+ 
+ import argparse
+ import os
++import platform
+ import unittest
+ 
+ from keylime.policy import create_mb_policy
+@@ -12,6 +13,7 @@ from keylime.policy import create_mb_policy
+ DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "data", "create-mb-policy"))
+ 
+ 
++@unittest.skipIf(platform.machine() in ["ppc64le", "s390x"], "ppc64le and s390x are not supported")
+ class CreateMeasuredBootPolicy_Test(unittest.TestCase):
+     def test_event_to_sha256(self):
+         test_cases = [
+diff --git a/test/test_mba_parsing.py b/test/test_mba_parsing.py
+index 670a602..e157116 100644
+--- a/test/test_mba_parsing.py
++++ b/test/test_mba_parsing.py
+@@ -1,10 +1,12 @@
+ import os
++import platform
+ import unittest
+ 
+ from keylime.common.algorithms import Hash
+ from keylime.mba import mba
+ 
+ 
++@unittest.skipIf(platform.machine() in ["ppc64le", "s390x"], "ppc64le and s390x are not supported")
+ class TestMBAParsing(unittest.TestCase):
+     def test_parse_bootlog(self):
+         """Test parsing binary measured boot event log"""
+-- 
+2.47.1
+

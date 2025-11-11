@@ -1,0 +1,42 @@
+From 1b7191098ca3f6d72c6ad218564ae0938a87efd4 Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Mon, 18 Aug 2025 12:22:55 +0000
+Subject: [PATCH 10/13] verifier: Gracefully shutdown on signal
+
+Wait for the processes to finish when interrupted by a signal.  Do not
+call exit(0) in the signal handler.
+
+Assisted-by: Claude 4 Sonnet
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/cloud_verifier_tornado.py | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/keylime/cloud_verifier_tornado.py b/keylime/cloud_verifier_tornado.py
+index 7553ac8..7065661 100644
+--- a/keylime/cloud_verifier_tornado.py
++++ b/keylime/cloud_verifier_tornado.py
+@@ -2138,7 +2138,7 @@ def main() -> None:
+             revocation_notifier.stop_broker()
+         for p in processes:
+             p.join()
+-        sys.exit(0)
++        # Do not call sys.exit(0) here as it interferes with multiprocessing cleanup
+ 
+     signal.signal(signal.SIGINT, sig_handler)
+     signal.signal(signal.SIGTERM, sig_handler)
+@@ -2159,3 +2159,11 @@ def main() -> None:
+         process = Process(target=server_process, args=(task_id, active_agents))
+         process.start()
+         processes.append(process)
++
++    # Wait for all worker processes to complete
++    try:
++        for p in processes:
++            p.join()
++    except KeyboardInterrupt:
++        # Signal handler will take care of cleanup
++        pass
+-- 
+2.47.3
+

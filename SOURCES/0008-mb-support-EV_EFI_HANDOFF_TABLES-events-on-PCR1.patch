@@ -1,0 +1,29 @@
+From d14e0a132cfedd081bffa7a990b9401d5e257cac Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Fri, 8 Aug 2025 16:40:01 +0100
+Subject: [PATCH 8/9] mb: support EV_EFI_HANDOFF_TABLES events on PCR1
+
+Allow EV_EFI_HANDOFF_TABLES events on PCR1 alongside the existing
+EV_EFI_HANDOFF_TABLES2 support to handle different firmware
+implementations, in the example policy.
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ keylime/mba/elchecking/example.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/keylime/mba/elchecking/example.py b/keylime/mba/elchecking/example.py
+index 2c6f699..a3d918a 100644
+--- a/keylime/mba/elchecking/example.py
++++ b/keylime/mba/elchecking/example.py
+@@ -185,6 +185,7 @@ class Example(policies.Policy):
+         # We only expect one EV_NO_ACTION event at the start.
+         dispatcher.set((0, "EV_NO_ACTION"), tests.OnceTest(tests.AcceptAll()))
+         dispatcher.set((1, "EV_CPU_MICROCODE"), tests.OnceTest(tests.AcceptAll()))
++        dispatcher.set((1, "EV_EFI_HANDOFF_TABLES"), tests.OnceTest(tests.AcceptAll()))
+         dispatcher.set((1, "EV_EFI_HANDOFF_TABLES2"), tests.OnceTest(tests.AcceptAll()))
+         dispatcher.set((0, "EV_S_CRTM_VERSION"), events_final.get("s_crtms"))
+         dispatcher.set((0, "EV_EFI_PLATFORM_FIRMWARE_BLOB"), events_final.get("platform_firmware_blobs"))
+-- 
+2.47.3
+
