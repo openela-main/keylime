@@ -9,7 +9,7 @@
 
 Name:    keylime
 Version: 7.12.1
-Release: 11%{?dist}
+Release: 11%{?dist}.2
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -39,6 +39,7 @@ Patch: 0009-mb-support-vendor_db-as-logged-by-newer-shim-version.patch
 Patch: 0010-verifier-Gracefully-shutdown-on-signal.patch
 Patch: 0011-revocations-Try-to-send-notifications-on-shutdown.patch
 Patch: 0012-requests_client-close-the-session-at-the-end-of-the-.patch
+Patch: 0013-fix-malformed-certs-workaround.patch
 
 License: ASL 2.0 and MIT
 
@@ -433,6 +434,10 @@ fi
 %license LICENSE
 
 %changelog
+* Mon Sep 15 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-11.2
+- Properly fix the malformed certificate workaround
+  Resolves: RHEL-111244
+
 * Mon Aug 18 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-11
 -  Fix for revocation notifier not closing TLS session correctly
    Resolves: RHEL-109656
