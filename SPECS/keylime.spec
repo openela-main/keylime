@@ -2,14 +2,14 @@
 ## (rpmautospec version 0.6.5)
 ## RPMAUTOSPEC: autorelease, autochangelog
 %define autorelease(e:s:pb:n) %{?-p:0.}%{lua:
-    release_number = 2;
+    release_number = 11;
     base_release_number = tonumber(rpm.expand("%{?-b*}%{!?-b:1}"));
     print(release_number + base_release_number - 1);
 }%{?-e:.%{-e*}}%{?-s:.%{-s*}}%{!?-n:%{?dist}}
 ## END: Set by rpmautospec
 
 %global srcname keylime
-%global policy_version 38.1.0
+%global policy_version 42.1.2
 
 # Package is actually noarch, but it has an optional dependency that is
 # arch-specific.
@@ -24,22 +24,60 @@ Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
 Source0:        https://github.com/keylime/keylime/archive/refs/tags/v%{version}.tar.gz
-Source1:        %{srcname}.sysusers
 # The selinux policy for keylime is distributed via this repo: https://github.com/RedHat-SP-Security/keylime-selinux
-Source2:        https://github.com/RedHat-SP-Security/%{name}-selinux/archive/v%{policy_version}/keylime-selinux-%{policy_version}.tar.gz
+Source1:        https://github.com/RedHat-SP-Security/%{name}-selinux/archive/v%{policy_version}/keylime-selinux-%{policy_version}.tar.gz
+Source2:        %{srcname}.sysusers
+Source3:        %{srcname}.tmpfiles
+
+# Backported from https://github.com/keylime/keylime/pull/1782
+# Fixes DB connections leaks (https://issues.redhat.com/browse/RHEL-102995)
+Patch:         keylime-fix-db-connection-leaks.patch
+
+# Backported from https://github.com/keylime/keylime/pull/1791
+Patch: 0002-mb-support-EV_EFI_HANDOFF_TABLES-events-on-PCR1.patch
+Patch: 0003-mb-support-vendor_db-as-logged-by-newer-shim-version.patch
+
+# Backported from https://github.com/keylime/keylime/pull/1784
+# and https://github.com/keylime/keylime/pull/1785
+Patch: 0004-verifier-Gracefully-shutdown-on-signal.patch
+Patch: 0005-revocations-Try-to-send-notifications-on-shutdown.patch
+Patch: 0006-requests_client-close-the-session-at-the-end-of-the-.patch
+
+# Backported from https://github.com/keylime/keylime/pull/1736,
+# https://github.com/keylime/keylime/commit/11c6b7f and
+# https://github.com/keylime/keylime/commit/dd63459
+Patch: 0007-tests-change-test_mba_parsing-to-not-need-keylime-in.patch
+Patch: 0008-tests-skip-measured-boot-related-tests-for-s390x-and.patch
+Patch: 0009-tests-fix-rpm-repo-tests-from-create-runtime-policy.patch
+
+# Backported from https://github.com/keylime/keylime/pull/1793
+Patch: 0010-mba-normalize-vendor_db-in-EV_EFI_VARIABLE_AUTHORITY.patch
 
 # Main program: Apache-2.0
 # Icons: MIT
 License: Apache-2.0 AND MIT
 
 BuildRequires: git-core
-BuildRequires: swig
+BuildRequires: openssl
 BuildRequires: openssl-devel
 BuildRequires: python3-devel
 BuildRequires: python3-dbus
 BuildRequires: python3-jinja2
+BuildRequires: python3-cryptography
+BuildRequires: python3-gpg
+BuildRequires: python3-pyasn1
+BuildRequires: python3-pyasn1-modules
+BuildRequires: python3-tornado
+BuildRequires: python3-sqlalchemy
+BuildRequires: python3-lark
+BuildRequires: python3-psutil
+BuildRequires: python3-pyyaml
+BuildRequires: python3-jsonschema
 BuildRequires: python3-setuptools
 BuildRequires: systemd-rpm-macros
+BuildRequires: rpm-sign
+BuildRequires: createrepo_c
+BuildRequires: tpm2-tools
 
 Requires: python3-%{srcname} = %{version}-%{release}
 Requires: %{srcname}-base = %{version}-%{release}
@@ -75,8 +113,8 @@ Conflicts: keylime < 6.3.0-3
 
 Requires(pre): python3-jinja2
 Requires(pre): shadow-utils
+Requires(pre): tpm2-tss
 Requires: procps-ng
-Requires: tpm2-tss
 Requires: openssl
 
 %if 0%{?with_selinux}
@@ -86,6 +124,7 @@ Recommends:       (%{srcname}-selinux if selinux-policy-%{selinuxtype})
 %endif
 
 %ifarch %efi
+BuildRequires: efivar-libs
 Requires: efivar-libs
 %endif
 
@@ -194,7 +233,7 @@ The keylime tools package includes miscelaneous tools.
 
 
 %prep
-%autosetup -S git -n %{srcname}-%{version} -a2
+%autosetup -S git -n %{srcname}-%{version} -a1
 
 %if 0%{?with_selinux}
 # SELinux policy (originally from selinux-policy-contrib)
@@ -248,17 +287,46 @@ install -Dpm 644 ./services/%{srcname}_verifier.service \
 install -Dpm 644 ./services/%{srcname}_registrar.service \
     %{buildroot}%{_unitdir}/%{srcname}_registrar.service
 
-cp -r ./tpm_cert_store %{buildroot}%{_sharedstatedir}/%{srcname}/
+# TPM cert store is deployed to both /usr/share/keylime/tpm_cert_store
+# and then /var/lib/keylime/tpm_cert_store.
+for cert_store_dir in %{_datadir} %{_sharedstatedir}; do
+    mkdir -p %{buildroot}/"${cert_store_dir}"/%{srcname}
+    cp -r ./tpm_cert_store %{buildroot}/"${cert_store_dir}"/%{srcname}/
+done
 
-install -p -d %{buildroot}/%{_tmpfilesdir}
-cat > %{buildroot}/%{_tmpfilesdir}/%{srcname}.conf << EOF
-d %{_rundir}/%{srcname} 0700 %{srcname} %{srcname} -
-EOF
+# Install the sysusers + tmpfiles.d configuration.
+install -p -D -m 0644 %{SOURCE2} %{buildroot}/%{_sysusersdir}/%{srcname}.conf
+install -p -D -m 0644 %{SOURCE3} %{buildroot}/%{_tmpfilesdir}/%{name}.conf
 
-install -p -D -m 0644 %{SOURCE1} %{buildroot}%{_sysusersdir}/%{srcname}.conf
+%check
+# Create the default configuration files to be used by the tests.
+# Also set the associated environment variables so that the tests
+# will actually use them.
+CONF_TEMP_DIR="$(mktemp -d)"
+
+%{python3} -m keylime.cmd.convert_config --out "${CONF_TEMP_DIR}" --templates templates/
+export KEYLIME_VERIFIER_CONFIG="${CONF_TEMP_DIR}/verifier.conf"
+export KEYLIME_TENANT_CONFIG="${CONF_TEMP_DIR}/tenant.conf"
+export KEYLIME_REGISTRAR_CONFIG="${CONF_TEMP_DIR}/registrar.conf"
+export KEYLIME_CA_CONFIG="${CONF_TEMP_DIR}/ca.conf"
+export KEYLIME_LOGGING_CONFIG="${CONF_TEMP_DIR}/logging.conf"
+
+# Run the tests.
+%{python3} -m unittest
+
+# Cleanup.
+[ "${CONF_TEMP_DIR}" ] && rm -rf "${CONF_TEMP_DIR}"
+    for e in KEYLIME_VERIFIER_CONFIG \
+        KEYLIME_TENANT_CONFIG \
+        KEYLIME_REGISTRAR_CONFIG \
+        KEYLIME_CA_CONFIG \
+        KEYLIME_LOGGING_CONFIG; do
+    unset "${e}"
+done
+exit 0
 
 %pre base
-%sysusers_create_compat %{SOURCE1}
+%sysusers_create_compat %{SOURCE2}
 exit 0
 
 %post base
@@ -282,10 +350,6 @@ fi
 [ -d %{_sharedstatedir}/%{srcname}/tpm_cert_store ] && \
     chmod 400 %{_sharedstatedir}/%{srcname}/tpm_cert_store/*.pem && \
     chmod 500 %{_sharedstatedir}/%{srcname}/tpm_cert_store/
-
-[ -d %{_localstatedir}/log/%{srcname} ] && \
-    chown -R %{srcname} %{_localstatedir}/log/%{srcname}/
-exit 0
 
 %post verifier
 /usr/bin/keylime_upgrade_config --component verifier >/dev/null
@@ -385,11 +449,14 @@ fi
 %files base
 %license LICENSE
 %doc README.md
+%attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}
 %attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}/{ca,logging}.conf.d
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/ca.conf
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/logging.conf
 %attr(700,%{srcname},%{srcname}) %dir %{_rundir}/%{srcname}
 %attr(700,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}
+%attr(500,%{srcname},%{srcname}) %dir %{_datadir}/%{srcname}/tpm_cert_store
+%attr(400,%{srcname},%{srcname}) %{_datadir}/%{srcname}/tpm_cert_store/*.pem
 %attr(500,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}/tpm_cert_store
 %attr(400,%{srcname},%{srcname}) %{_sharedstatedir}/%{srcname}/tpm_cert_store/*.pem
 %{_tmpfilesdir}/%{srcname}.conf
@@ -403,6 +470,33 @@ fi
 
 %changelog
 ## START: Generated by rpmautospec
+* Wed Aug 20 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-11
+- mba: normalize vendor_db in EV_EFI_VARIABLE_AUTHORITY events
+
+* Mon Aug 18 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-10
+- Fix for revocation notifier not closing TLS session correctly
+
+* Tue Aug 12 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-9
+- Support vendor_db as logged by newer shim versions
+
+* Fri Aug 08 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-8
+- Fix DB connection leaks
+
+* Thu Jul 24 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-7
+- Fix tmpfiles.d configuration related to the cert store
+
+* Thu Jul 10 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-6
+- Populate cert_store_dir with tpmfiles.d
+
+* Thu Jul 10 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-5
+- Use tmpfiles.d for permissions in /var/lib/keylime and /etc/keylime
+
+* Wed Jul 09 2025 Patrik Koncity <pkoncity@redhat.com> - 7.12.1-4
+- Use the newest keylime-selinux release
+
+* Wed Jul 02 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-3
+- Avoid changing the ownership of /var/log/keylime
+
 * Mon Feb 17 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-2
 - Drop old keylime policy related scripts
 

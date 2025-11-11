@@ -1,0 +1,45 @@
+From e6fb5090df3e35c7d44bc8f7f37d420d7ee8a05c Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Wed, 4 Jun 2025 19:52:37 +0100
+Subject: [PATCH 6/7] requests_client: close the session at the end of the
+ resource manager
+
+We had an issue in the past in which the webhook worker would not
+properly close the opened session. This was fixed in #1456 (Close
+session in worker_webhook function).
+
+At some later point, in #1566 (revocation_notifier: Take into account CA
+certificates added via configuration), some refactoring around the
+webhook_worker() in revocation_notifier happened and it started using
+the RequestsClient resource manager.
+
+However, the RequestsClient does not close the session at its end, which
+in turns makes that the old issue of not closing properly the session
+in the webhook_worker() returned.
+
+We now issue a session.close() at the end of the RequestsClient.
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ keylime/requests_client.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/keylime/requests_client.py b/keylime/requests_client.py
+index 16615f7..b7da484 100644
+--- a/keylime/requests_client.py
++++ b/keylime/requests_client.py
+@@ -40,7 +40,10 @@ class RequestsClient:
+         return self
+ 
+     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+-        pass
++        try:
++            self.session.close()
++        except Exception:
++            pass
+ 
+     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+         return self.session.request(method, self.base_url + url, **kwargs)
+-- 
+2.47.3
+
