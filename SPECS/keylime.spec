@@ -9,7 +9,7 @@
 
 Name:    keylime
 Version: 7.12.1
-Release: 11%{?dist}.2
+Release: 11%{?dist}.3
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -40,6 +40,13 @@ Patch: 0010-verifier-Gracefully-shutdown-on-signal.patch
 Patch: 0011-revocations-Try-to-send-notifications-on-shutdown.patch
 Patch: 0012-requests_client-close-the-session-at-the-end-of-the-.patch
 Patch: 0013-fix-malformed-certs-workaround.patch
+
+# CVE-2025-13609
+# Backports from:
+# - https://github.com/keylime/keylime/pull/1817/commits/1024e19d
+# - https://github.com/keylime/keylime/pull/1825
+Patch: 0014-Add-shared-memory-infrastructure-for-multiprocess-co.patch
+Patch: 0015-Fix-registrar-duplicate-UUID-vulnerability.patch
 
 License: ASL 2.0 and MIT
 
@@ -434,6 +441,10 @@ fi
 %license LICENSE
 
 %changelog
+* Fri Dec 12 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-11.3
+- Registrar allows identity takeover via duplicate UUID registration
+  Resolves: RHEL-130760
+
 * Mon Sep 15 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-11.2
 - Properly fix the malformed certificate workaround
   Resolves: RHEL-111244
