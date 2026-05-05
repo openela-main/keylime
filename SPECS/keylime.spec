@@ -9,7 +9,7 @@
 
 Name:    keylime
 Version: 7.12.1
-Release: 11%{?dist}.4
+Release: 11%{?dist}.5
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -50,6 +50,12 @@ Patch: 0015-Fix-registrar-duplicate-UUID-vulnerability.patch
 
 # CVE-2026-1709
 Patch: 0016-CVE-2026-1709.patch
+
+# Tenant version negotiation.
+# Backport from:
+# - https://github.com/keylime/keylime/pull/1838
+# - https://github.com/keylime/keylime/pull/1845
+Patch: 0017-Backport-tenant-version-negotiation-mechanism.patch
 
 License: ASL 2.0 and MIT
 
@@ -444,6 +450,10 @@ fi
 %license LICENSE
 
 %changelog
+* Fri Apr 17 2026 Sergio Correia <scorreia@redhat.com> - 7.12.1-11.5
+- Add API version negotiation to keylime_tenant
+  Resolves: RHEL-154784
+
 * Tue Feb 03 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-11.4
 - CVE-2026-1709: Registrar authentication bypass
   Resolves: RHEL-145390
