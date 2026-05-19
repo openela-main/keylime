@@ -1,0 +1,108 @@
+From 08c0c67c492ef27df53fa9bff899597c46ae6fc8 Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Fri, 13 Mar 2026 13:59:23 +0100
+Subject: [PATCH] fix: Check active flag in _extract_identity and guard
+ receive_pop
+
+receive_pop() was unconditionally setting active=True and
+token_expires_at even when TPM verification failed. Use `any(errs for
+errs in self.errors.values())` to check for non-empty error lists,
+matching the pattern already used in session_controller.py.
+
+This didn't affect the security because on failure the state was not
+persisted in the database. Now these are only set when no errors
+occurred.
+
+_extract_identity() was not checking the session active flag, which
+could allow authentication with an inactive session if the state was
+persisted. Add the active check as defense-in-depth.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/models/verifier/auth_session.py |  9 ++++---
+ keylime/web/base/action_handler.py      | 36 +++++++++++++++++++------
+ 2 files changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/keylime/models/verifier/auth_session.py b/keylime/models/verifier/auth_session.py
+index b0b40b0..fc5c8df 100644
+--- a/keylime/models/verifier/auth_session.py
++++ b/keylime/models/verifier/auth_session.py
+@@ -630,10 +630,11 @@ class AuthSession(PersistableModel):
+             logger.error("Unexpected error during TPM verification: %s: %s", type(e).__name__, e)
+             self._add_error("verification", f"TPM verification failed: {str(e)}")
+ 
+-        # Set token expiration (only on successful validation)
+-        session_lifetime = config.getint("verifier", "session_lifetime", fallback=config.DEFAULT_SESSION_LIFETIME)
+-        self.token_expires_at = Timestamp.now() + timedelta(seconds=session_lifetime)
+-        self.active = True
++        # Set token expiration and activate only on successful validation
++        if not any(errs for errs in self.errors.values()):
++            session_lifetime = config.getint("verifier", "session_lifetime", fallback=config.DEFAULT_SESSION_LIFETIME)
++            self.token_expires_at = Timestamp.now() + timedelta(seconds=session_lifetime)
++            self.active = True
+ 
+     def _set_nonce(self):
+         if "nonce" not in self.values:
+diff --git a/keylime/web/base/action_handler.py b/keylime/web/base/action_handler.py
+index d14c9ee..68dd30d 100644
+--- a/keylime/web/base/action_handler.py
++++ b/keylime/web/base/action_handler.py
+@@ -265,12 +265,18 @@ class ActionHandler(RequestHandler):
+                 # Look up by token hash (tokens are never stored in plaintext)
+                 auth_session = AuthSession.get_by_token(token)
+                 if auth_session and auth_session.agent_id:  # type: ignore[attr-defined]
+-                    # Check if token is still valid
+-                    now = Timestamp.now()
+-                    if auth_session.token_expires_at >= now:  # type: ignore[attr-defined]
+-                        logger.debug("Extracted agent identity from bearer token: %s", auth_session.agent_id)  # type: ignore[attr-defined]
+-                        return (auth_session.agent_id, "agent")  # type: ignore[attr-defined]
+-                    logger.debug("Bearer token expired for agent: %s", auth_session.agent_id)  # type: ignore[attr-defined]
++                    # Check if session is active and token is still valid
++                    if not getattr(auth_session, "active", False):
++                        logger.debug("Session not active for agent: %s", auth_session.agent_id)  # type: ignore[attr-defined]
++                    else:
++                        token_expires_at = getattr(auth_session, "token_expires_at", None)
++                        if token_expires_at is None:
++                            logger.debug("Session has no expiry for agent: %s", auth_session.agent_id)  # type: ignore[attr-defined]
++                        elif token_expires_at >= Timestamp.now():
++                            logger.debug("Extracted agent identity from bearer token: %s", auth_session.agent_id)  # type: ignore[attr-defined]
++                            return (auth_session.agent_id, "agent")  # type: ignore[attr-defined]
++                        else:
++                            logger.debug("Bearer token expired for agent: %s", auth_session.agent_id)  # type: ignore[attr-defined]
+                 else:
+                     logger.debug("Invalid bearer token provided")
+             else:
+@@ -520,13 +526,27 @@ class ActionHandler(RequestHandler):
+             self.finish()
+             return False
+ 
++        # Check if session is active
++        if not getattr(auth_session, "active", False):
++            logger.info(
++                "Authentication session not active for agent '%s'",
++                auth_session.agent_id,  # type: ignore[attr-defined]
++            )
++            self.set_status(401)
++            self.write(
++                {"errors": [{"status": "401", "title": "Unauthorized", "detail": "Authentication session not active"}]}
++            )
++            self.finish()
++            return False
++
+         # Check if token has expired
++        token_expires_at = getattr(auth_session, "token_expires_at", None)
+         now = Timestamp.now()
+-        if auth_session.token_expires_at < now:  # type: ignore[attr-defined]
++        if token_expires_at is None or token_expires_at < now:
+             logger.info(
+                 "Authentication token expired for agent '%s' (expired at %s)",
+                 auth_session.agent_id,  # type: ignore[attr-defined]
+-                auth_session.token_expires_at,  # type: ignore[attr-defined]
++                token_expires_at,
+             )
+             self.set_status(401)
+             self.write(
+-- 
+2.53.0
+

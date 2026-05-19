@@ -1,0 +1,92 @@
+From d74e7499746917fa7b9fbba02972eed82bc7ece9 Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Fri, 13 Mar 2026 16:04:45 +0100
+Subject: [PATCH] fix: Add fork-safety to DBManager via dispose()
+
+After forking worker processes, child processes inherited the parent's
+db_manager engine and connection pool. Sharing SQLAlchemy connection
+pools across fork boundaries is unsafe and can lead to corruption.
+
+Add DBManager.dispose() to clear engine, scoped session, and registry
+state. Call it in verifier_server.py after fork (alongside the existing
+reset_verifier_config()), then immediately re-create the engine with
+make_engine() so the child has its own fresh connection pool.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/models/base/db.py  | 22 +++++++++++++++++++---
+ keylime/web/base/server.py | 10 ++++++++++
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/keylime/models/base/db.py b/keylime/models/base/db.py
+index 9678098..bb218cf 100644
+--- a/keylime/models/base/db.py
++++ b/keylime/models/base/db.py
+@@ -101,9 +101,6 @@ class DBManager:
+ 
+     @property
+     def service(self) -> Optional[str]:
+-        if not self._service:
+-            raise BackendMissing("cannot access the service for a DBManager before a call to db_manager.make_engine()")
+-
+         return self._service
+ 
+     @property
+@@ -138,6 +135,25 @@ class DBManager:
+ 
+         return cast(Session, self._scoped_session())
+ 
++    def dispose(self) -> None:
++        """Dispose the engine and clear all state.
++
++        Must be called after fork to avoid sharing the parent's connection pool
++        across child processes. The next call to make_engine() will create fresh
++        connections for the child process.
++        """
++        if self._scoped_session:
++            self._scoped_session.remove()
++        if self._engine:
++            # Use close=False so the child discards the inherited pool
++            # without closing the parent's underlying connections. Per
++            # SQLAlchemy docs, this is the recommended approach after fork.
++            self._engine.dispose(close=False)  # type: ignore[call-arg]
++        self._engine = None
++        self._scoped_session = None
++        self._registry = None
++        self._service = None
++
+     def remove_session(self) -> None:
+         """Remove the current scoped session, releasing its connection back to the pool and clearing the identity map.
+ 
+diff --git a/keylime/web/base/server.py b/keylime/web/base/server.py
+index e053bbb..913a498 100644
+--- a/keylime/web/base/server.py
++++ b/keylime/web/base/server.py
+@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
+ import tornado
+ 
+ from keylime import api_version, config, keylime_logging, web_util
++from keylime.models.base.db import db_manager
+ from keylime.web.base.action_handler import ActionHandler
+ from keylime.web.base.route import Route
+ 
+@@ -299,6 +300,15 @@ class Server(ABC):
+         tornado.process.fork_processes(self.worker_count)
+         # num.value = num.value + 1
+         # print(num.value)
++
++        # Dispose inherited db_manager engine after fork to avoid sharing the
++        # parent's connection pool, then re-create with a fresh pool for this
++        # child process.
++        service = db_manager.service
++        db_manager.dispose()
++        if service:
++            db_manager.make_engine(service)
++
+         asyncio.run(self.start_single())
+ 
+     def _setup(self) -> None:
+-- 
+2.53.0
+

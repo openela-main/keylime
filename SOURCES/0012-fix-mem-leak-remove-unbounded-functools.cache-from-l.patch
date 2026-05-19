@@ -1,0 +1,274 @@
+From fb06907b383512a6942dc489a62eee0da92fbac6 Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Wed, 18 Mar 2026 05:34:30 +0000
+Subject: [PATCH 12/12] fix(mem leak) - remove unbounded functools.cache from
+ latest_attestation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+@cache (= lru_cache(maxsize=None)) on the latest_attestation property
+creates a class-level cache keyed by self. Since VerifierAgent.get()
+creates a new instance per call, and the push-mode controller calls it
+2-3x per attestation cycle, the cache permanently holds strong references
+to every instance (and its eagerly-loaded IMAPolicy data), preventing
+garbage collection.
+
+The property is accessed a few times per attestation cycle — a simple DB
+query each time is negligible compared to the cost of permanently
+retaining every VerifierAgent instance in memory.
+
+Additionally, cache `agent.latest_attestation` in a local variable in
+each controller method to avoid redundant DB queries per request, and
+add an inline warning comment to prevent re-introduction of the cache.
+
+Assisted-by: Claude Sonnet 4.6
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ keylime/models/verifier/verifier_agent.py     |  5 +-
+ .../web/verifier/attestation_controller.py    | 58 +++++++++++--------
+ test/test_attestation_controller.py           |  8 +--
+ test/test_attestation_model.py                | 26 +++++++++
+ 4 files changed, 65 insertions(+), 32 deletions(-)
+
+diff --git a/keylime/models/verifier/verifier_agent.py b/keylime/models/verifier/verifier_agent.py
+index 0373e87..515df07 100644
+--- a/keylime/models/verifier/verifier_agent.py
++++ b/keylime/models/verifier/verifier_agent.py
+@@ -1,7 +1,5 @@
+ # pyright: reportAttributeAccessIssue=false
+ # ORM model with dynamically-created attributes from metaclasses
+-from functools import cache
+-
+ from keylime.models.base import *
+ 
+ 
+@@ -97,8 +95,9 @@ class VerifierAgent(PersistableModel):
+         # TODO: remove above, based on feedback
+ 
+     @property
+-    @cache  # pylint: disable=method-cache-max-size-none  # Intentional unbounded cache for ORM property
+     def latest_attestation(self):
++        # NOTE: Do not cache this property. Caching causes a memory leak because
++        # the cache holds strong references to every VerifierAgent instance.
+         # Lazy import to avoid circular dependency
+         import keylime.models.verifier as verifier_models  # pylint: disable=import-outside-toplevel
+ 
+diff --git a/keylime/web/verifier/attestation_controller.py b/keylime/web/verifier/attestation_controller.py
+index d660c0f..5951e4c 100755
+--- a/keylime/web/verifier/attestation_controller.py
++++ b/keylime/web/verifier/attestation_controller.py
+@@ -205,10 +205,12 @@ class AttestationController(Controller):
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+ 
+-        if not agent.latest_attestation:  # type: ignore[union-attr]
++        latest = agent.latest_attestation  # type: ignore[union-attr]
++
++        if not latest:
+             APIError("not_found", f"No attestation exists for agent '{agent_id}'.").send_via(self)
+ 
+-        self.show(agent_id, agent.latest_attestation.index, **_params)  # type: ignore[union-attr, no-untyped-call]
++        self.show(agent_id, latest.index, **_params)  # type: ignore[union-attr, no-untyped-call]
+ 
+     # POST /v3[.:minor]/agents/:agent_id/attestations
+     @Controller.require_json_api
+@@ -231,13 +233,15 @@ class AttestationController(Controller):
+                     f"attestation not passing verification."
+                 ).send_via(self)
+ 
++        latest = agent.latest_attestation  # type: ignore[union-attr]
++
+         # Per enhancement #103, section "Error Conditions for Attestation Protocol":
+         # If last attestation failed AND policy hasn't changed, return 503 with exponential backoff
+         # Skip this for PUSH mode agents to allow immediate recovery from timeout-induced failures
+         if (
+-            agent.latest_attestation  # type: ignore[union-attr]
+-            and agent.latest_attestation.evaluation == "fail"  # type: ignore[union-attr]
+-            and agent.latest_attestation.stage == "verification_complete"  # type: ignore[union-attr]
++            latest
++            and latest.evaluation == "fail"
++            and latest.stage == "verification_complete"
+             and not agent_util.is_push_mode_agent(agent)  # type: ignore[arg-type]
+         ):
+             # Calculate retry-after using exponential backoff (same formula as rest of codebase)
+@@ -257,19 +261,19 @@ class AttestationController(Controller):
+                 f"If the failure was due to policy violation, update the policy or fix the agent before retrying."
+             ).send_via(self)
+ 
+-        if agent.latest_attestation and agent.latest_attestation.verification_in_progress:  # type: ignore[union-attr]
+-            self.set_header("Retry-After", str(agent.latest_attestation.seconds_to_decision))  # type: ignore[no-untyped-call, union-attr]
++        if latest and latest.verification_in_progress:
++            self.set_header("Retry-After", str(latest.seconds_to_decision))  # type: ignore[no-untyped-call]
+             APIError("verification_in_progress", 503).set_detail(
+                 f"Cannot create attestation for agent '{agent_id}' while the last attestation is still being "
+                 f"verified. The active verification task is expected to complete or time out within "
+-                f"{agent.latest_attestation.seconds_to_decision} seconds."  # type: ignore[union-attr]
++                f"{latest.seconds_to_decision} seconds."
+             ).send_via(self)
+ 
+-        if agent.latest_attestation and not agent.latest_attestation.ready_for_next_attestation:  # type: ignore[union-attr]
+-            self.set_header("Retry-After", str(agent.latest_attestation.seconds_to_next_attestation))  # type: ignore[no-untyped-call, union-attr]
++        if latest and not latest.ready_for_next_attestation:
++            self.set_header("Retry-After", str(latest.seconds_to_next_attestation))  # type: ignore[no-untyped-call]
+             APIError("premature_attestation", 429).set_detail(
+                 f"Cannot create attestation for agent '{agent_id}' before the configured interval has elapsed. "
+-                f"Wait {agent.latest_attestation.seconds_to_next_attestation} seconds before trying again."  # type: ignore[union-attr]
++                f"Wait {latest.seconds_to_next_attestation} seconds before trying again."
+             ).send_via(self)
+ 
+         attestation_record = Attestation.create(agent)  # type: ignore[no-untyped-call]
+@@ -314,25 +318,27 @@ class AttestationController(Controller):
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+ 
++        latest = agent.latest_attestation  # type: ignore[union-attr]
++
+         # If there are no attestations for the agent, the attestation at 'index' does not exist
+-        if not agent.latest_attestation:  # type: ignore[union-attr]
++        if not latest:
+             APIError("not_found", f"No attestation {index} exists for agent '{agent_id}'.").send_via(self)
+ 
+         # Only allow the attestation at 'index' to be updated if it is the latest attestation
+-        if str(agent.latest_attestation.index) != index:  # type: ignore[union-attr]
++        if str(latest.index) != str(index):  # type: ignore[union-attr]
+             APIError("old_attestation", 403).set_detail(
+                 f"Attestation {index} is not the latest for agent '{agent_id}'. Only evidence for the most recent "
+                 f"attestation may be updated."
+             ).send_via(self)
+ 
+-        if agent.latest_attestation.stage != "awaiting_evidence":  # type: ignore[union-attr]
++        if latest.stage != "awaiting_evidence":  # type: ignore[union-attr]
+             APIError("evidence_immutable", 403).set_detail(
+                 f"Cannot alter evidence for attestation {index} which has already been received and accepted."
+             ).send_via(self)
+ 
+-        if not agent.latest_attestation.challenges_valid:  # type: ignore[union-attr]
++        if not latest.challenges_valid:  # type: ignore[union-attr]
+             APIError("challenges_expired", 403).set_detail(
+-                f"Challenges for attestation {index} expired at {agent.latest_attestation.challenges_expire_at}. "  # type: ignore[union-attr]
++                f"Challenges for attestation {index} expired at {latest.challenges_expire_at}. "  # type: ignore[union-attr]
+                 f"Create a new attestation and try again."
+             ).send_via(self)
+ 
+@@ -341,21 +347,21 @@ class AttestationController(Controller):
+                 "Request body must include attestation evidence data."
+             ).send_via(self)
+ 
+-        agent.latest_attestation.receive_evidence(attestation)  # type: ignore[no-untyped-call, union-attr]
+-        driver = EngineDriver(agent.latest_attestation).process_evidence()  # type: ignore[no-untyped-call, union-attr]
++        latest.receive_evidence(attestation)  # type: ignore[no-untyped-call, union-attr]
++        driver = EngineDriver(latest).process_evidence()  # type: ignore[no-untyped-call, union-attr]
+ 
+         # Send error if the received evidence appears invalid
+-        if not agent.latest_attestation.changes_valid:  # type: ignore[union-attr]
+-            APIMessageBody.from_record_errors(agent.latest_attestation).send_via(self)  # type: ignore[no-untyped-call, union-attr]
++        if not latest.changes_valid:  # type: ignore[union-attr]
++            APIMessageBody.from_record_errors(latest).send_via(self)  # type: ignore[no-untyped-call, union-attr]
+ 
+-        agent.latest_attestation.commit_changes()  # type: ignore[no-untyped-call, union-attr]
++        latest.commit_changes()  # type: ignore[no-untyped-call, union-attr]
+ 
+         # Send acknowledgement of received evidence, but continue executing
+         APIMessageBody(
+-            APIResource("attestation", agent.latest_attestation.render_evidence_acknowledged()).include(  # type: ignore[no-untyped-call, union-attr]
++            APIResource("attestation", latest.render_evidence_acknowledged()).include(  # type: ignore[no-untyped-call, union-attr]
+                 APILink("self", f"/{self.version}/agents/{agent_id}/attestations/{index}")
+             ),
+-            APIMeta("seconds_to_next_attestation", agent.latest_attestation.seconds_to_next_attestation),  # type: ignore[union-attr]
++            APIMeta("seconds_to_next_attestation", latest.seconds_to_next_attestation),  # type: ignore[union-attr]
+         ).send_via(
+             self, code=202, stop_action=False
+         )  # type: ignore[no-untyped-call]
+@@ -372,8 +378,10 @@ class AttestationController(Controller):
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+ 
+-        if not agent.latest_attestation:  # type: ignore[union-attr]
++        latest = agent.latest_attestation  # type: ignore[union-attr]
++
++        if not latest:
+             APIError("not_found", f"No attestation exists for agent '{agent_id}'.").send_via(self)
+ 
+         # Call update with the same params, which includes attestation
+-        self.update(agent_id, agent.latest_attestation.index, **params)  # type: ignore[union-attr]
++        self.update(agent_id, latest.index, **params)  # type: ignore[union-attr]
+diff --git a/test/test_attestation_controller.py b/test/test_attestation_controller.py
+index e644e10..37e059c 100644
+--- a/test/test_attestation_controller.py
++++ b/test/test_attestation_controller.py
+@@ -43,7 +43,7 @@ class TestAttestationControllerParameterHandling(unittest.TestCase):
+         self.controller._api_request_body = Mock()  # pylint: disable=protected-access
+ 
+         self.agent_id = "test-agent-123"
+-        self.attestation_index = "1"  # String, as it comes from URL route
++        self.attestation_index = 1  # Integer, as it comes from the ORM Integer column
+ 
+         # Mock attestation evidence data
+         self.attestation_data = {
+@@ -270,7 +270,7 @@ class TestAttestationControllerErrorMessages(unittest.TestCase):
+         self.controller._api_request_body = Mock()  # pylint: disable=protected-access
+ 
+         self.agent_id = "test-agent-123"
+-        self.attestation_index = "1"  # String, as it comes from URL route
++        self.attestation_index = 1  # Integer, as it comes from the ORM Integer column
+ 
+     @patch("keylime.web.verifier.attestation_controller.APIError")
+     @patch("keylime.web.verifier.attestation_controller.VerifierAgent")
+@@ -772,7 +772,7 @@ class TestAttestationControllerGetMethods(unittest.TestCase):
+         # Setup mock agent with latest attestation
+         mock_agent = Mock(spec=VerifierAgent)
+         mock_attestation = Mock()
+-        mock_attestation.index = "5"
++        mock_attestation.index = 5
+         mock_attestation.render_state = Mock(return_value={})
+         mock_agent.latest_attestation = mock_attestation
+         mock_agent_class.get.return_value = mock_agent
+@@ -792,7 +792,7 @@ class TestAttestationControllerGetMethods(unittest.TestCase):
+                     self.controller.show_latest(self.agent_id)
+ 
+                     # Verify it called show() with the latest attestation index
+-                    mock_attestation_class.get.assert_called_once_with(agent_id=self.agent_id, index="5")
++                    mock_attestation_class.get.assert_called_once_with(agent_id=self.agent_id, index=5)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/test/test_attestation_model.py b/test/test_attestation_model.py
+index 9bc1abb..2651bc2 100644
+--- a/test/test_attestation_model.py
++++ b/test/test_attestation_model.py
+@@ -964,5 +964,31 @@ class TestAttestationModel(unittest.TestCase):
+         self.assertFalse(attestation.ready_for_next_attestation)
+ 
+ 
++class TestVerifierAgentLatestAttestation(unittest.TestCase):
++    """Test that VerifierAgent.latest_attestation is not cached (memory leak fix)"""
++
++    def test_latest_attestation_not_cached(self):
++        """Verify the property has no functools.cache wrapper"""
++        prop_fget = VerifierAgent.latest_attestation.fget
++        # @cache adds cache_info and __wrapped__ attributes
++        self.assertFalse(hasattr(prop_fget, "cache_info"))
++        self.assertFalse(hasattr(prop_fget, "__wrapped__"))
++
++    def test_latest_attestation_calls_db_each_time(self):
++        """Verify each access queries the DB (no stale cache)"""
++        with patch("keylime.models.verifier.Attestation.get_latest") as mock_get:
++            mock_get.return_value = None
++
++            # Call the underlying function directly to avoid needing db_manager setup
++            prop_fget = VerifierAgent.latest_attestation.fget
++            assert prop_fget is not None
++            fake_agent = MagicMock()
++            fake_agent.agent_id = "test-agent"
++
++            prop_fget(fake_agent)
++            prop_fget(fake_agent)
++            self.assertEqual(mock_get.call_count, 2)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.52.0
+

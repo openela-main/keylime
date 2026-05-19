@@ -1,0 +1,79 @@
+From 4f5f09a69e01c0116f1977aa3a741f3678bb8e67 Mon Sep 17 00:00:00 2001
+From: Sergio Arroutbi <sarroutb@redhat.com>
+Date: Thu, 12 Mar 2026 15:18:56 +0100
+Subject: [PATCH 5/6] Address some improvements from code review
+
+Include agent variable None initialization
+and address thread safety for ContextManager
+
+Signed-off-by: Sergio Arroutbi <sarroutb@redhat.com>
+---
+ keylime/db/keylime_db.py                   | 7 ++++++-
+ keylime/web/verifier/session_controller.py | 3 +++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/keylime/db/keylime_db.py b/keylime/db/keylime_db.py
+index 6fd3f08..cf608fa 100644
+--- a/keylime/db/keylime_db.py
++++ b/keylime/db/keylime_db.py
+@@ -1,4 +1,5 @@
+ import os
++import threading
+ from configparser import NoOptionError
+ from contextlib import contextmanager
+ from sqlite3 import Connection as SQLite3Connection
+@@ -89,10 +90,12 @@ def make_engine(service: str, **engine_args: Any) -> Engine:
+ class SessionManager:
+     engine: Optional[Engine]
+     _scoped_session: Optional[scoped_session]
++    _lock: threading.Lock
+ 
+     def __init__(self) -> None:
+         self.engine = None
+         self._scoped_session = None
++        self._lock = threading.Lock()
+ 
+     def make_session(self, engine: Engine) -> Session:
+         """
+@@ -100,7 +103,9 @@ class SessionManager:
+         """
+         self.engine = engine
+         if self._scoped_session is None:
+-            self._scoped_session = scoped_session(sessionmaker())
++            with self._lock:
++                if self._scoped_session is None:
++                    self._scoped_session = scoped_session(sessionmaker())
+         try:
+             self._scoped_session.configure(bind=self.engine)  # type: ignore
+             self._scoped_session.configure(expire_on_commit=False)  # type: ignore
+diff --git a/keylime/web/verifier/session_controller.py b/keylime/web/verifier/session_controller.py
+index 3faa310..c8664e2 100644
+--- a/keylime/web/verifier/session_controller.py
++++ b/keylime/web/verifier/session_controller.py
+@@ -185,6 +185,7 @@ class SessionController(Controller):
+             return
+ 
+         # Check if agent exists - this is where we validate enrollment
++        agent = None
+         with get_session_context() as session:
+             agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
+             if agent:
+@@ -382,6 +383,7 @@ class SessionController(Controller):
+ 
+     # POST /v3[.:minor]/agents/:agent_id/session
+     def create(self, agent_id, **params):
++        agent = None
+         with get_session_context() as session:
+             agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
+             if agent:
+@@ -407,6 +409,7 @@ class SessionController(Controller):
+         self.respond(200, "Success", auth_session.render())
+ 
+     def update(self, agent_id, token, **params):
++        agent = None
+         with get_session_context() as session:
+             agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
+             if agent:
+-- 
+2.53.0
+

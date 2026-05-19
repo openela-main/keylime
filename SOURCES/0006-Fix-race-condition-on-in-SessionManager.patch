@@ -1,0 +1,42 @@
+From 309a0ef0fe1d0917ad9d4fd7ab4327570a59cf34 Mon Sep 17 00:00:00 2001
+From: Sergio Arroutbi <sarroutb@redhat.com>
+Date: Thu, 12 Mar 2026 19:18:56 +0100
+Subject: [PATCH 6/6] Fix race condition on in SessionManager
+
+Move self.engine assignment inside the lock so it is set atomically
+with _scoped_session creation. Without this, concurrent threads calling
+make_session() with different engines could race on the assignment,
+causing _scoped_session to be configured with a stale engine reference.
+
+Also log a warning if make_session() is called with a different engine
+after initialization, since the scoped_session is cached and bound to
+the original engine.
+
+Suggested-by: coderabbitai
+Signed-off-by: Sergio Arroutbi <sarroutb@redhat.com>
+---
+ keylime/db/keylime_db.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/keylime/db/keylime_db.py b/keylime/db/keylime_db.py
+index cf608fa..a622b09 100644
+--- a/keylime/db/keylime_db.py
++++ b/keylime/db/keylime_db.py
+@@ -101,11 +101,13 @@ class SessionManager:
+         """
+         To use: session = self.make_session(engine)
+         """
+-        self.engine = engine
+         if self._scoped_session is None:
+             with self._lock:
+                 if self._scoped_session is None:
++                    self.engine = engine
+                     self._scoped_session = scoped_session(sessionmaker())
++        elif self.engine is not engine:
++            logger.warning("SessionManager called with different engine than originally configured")
+         try:
+             self._scoped_session.configure(bind=self.engine)  # type: ignore
+             self._scoped_session.configure(expire_on_commit=False)  # type: ignore
+-- 
+2.53.0
+

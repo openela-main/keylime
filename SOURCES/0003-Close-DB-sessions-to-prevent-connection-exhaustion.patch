@@ -1,0 +1,343 @@
+From 5b622eae9244b5a820263609cae6bd4681d3fbb2 Mon Sep 17 00:00:00 2001
+From: Sergio Arroutbi <sarroutb@redhat.com>
+Date: Tue, 10 Mar 2026 11:26:49 +0100
+Subject: [PATCH 3/6] Close DB sessions to prevent connection exhaustion
+
+Resolves: #1861
+
+The get_session() function in session_controller.py and auth_session.py
+returned SQLAlchemy sessions that were never closed, leaking connections
+back to the pool. Under load (e.g., multi-host push attestation with
+multiple agents), this exhausted the QueuePool (size 5, overflow 10),
+causing a 30-second timeout and HTTP 500 errors.
+
+Replace get_session() with a get_session_context() context manager that
+guarantees session.close() via try/finally. Define it once in
+auth_session.py and import it in session_controller.py.
+
+Resolves: connection pool exhaustion (QueuePool limit of size 5
+overflow 10 reached) during push attestation multi-host tests.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Signed-off-by: Sergio Arroutbi <sarroutb@redhat.com>
+---
+ keylime/models/verifier/auth_session.py    | 25 +++++++++-----
+ keylime/web/verifier/session_controller.py | 27 ++++-----------
+ test/test_auth_session.py                  | 38 ++++++++++++++++++++--
+ test/test_session_controller.py            | 32 ++++++++++--------
+ 4 files changed, 77 insertions(+), 45 deletions(-)
+
+diff --git a/keylime/models/verifier/auth_session.py b/keylime/models/verifier/auth_session.py
+index df01668..545995f 100644
+--- a/keylime/models/verifier/auth_session.py
++++ b/keylime/models/verifier/auth_session.py
+@@ -1,8 +1,9 @@
+ import base64
+ import hmac
+ import uuid
++from contextlib import contextmanager
+ from datetime import timedelta
+-from typing import Any, Dict, Optional, Sequence
++from typing import Any, Dict, Iterator, Optional, Sequence
+ 
+ from sqlalchemy.orm import Session
+ 
+@@ -32,11 +33,17 @@ logger = keylime_logging.init_logging("verifier")
+ _engine = None
+ 
+ 
+-def get_session() -> Session:
++@contextmanager
++def get_session_context() -> Iterator[Session]:
+     global _engine
+     if _engine is None:
+         _engine = make_engine("cloud_verifier")
+-    return SessionManager().make_session(_engine)
++    session_manager = SessionManager()
++    session = session_manager.make_session(_engine)
++    try:
++        yield session
++    finally:
++        session.close()
+ 
+ 
+ class AuthSession(PersistableModel):
+@@ -270,12 +277,12 @@ class AuthSession(PersistableModel):
+             return False
+ 
+         # Use old engine to query VerfierMain (legacy model)
+-        session = get_session()
+-        agent = (
+-            session.query(VerfierMain)
+-            .filter(VerfierMain.agent_id == auth_session.agent_id)  # type: ignore[attr-defined]
+-            .one_or_none()
+-        )
++        with get_session_context() as session:
++            agent = (
++                session.query(VerfierMain)
++                .filter(VerfierMain.agent_id == auth_session.agent_id)  # type: ignore[attr-defined]
++                .one_or_none()
++            )
+ 
+         return agent
+ 
+diff --git a/keylime/web/verifier/session_controller.py b/keylime/web/verifier/session_controller.py
+index 9fc3bb5..49cd758 100644
+--- a/keylime/web/verifier/session_controller.py
++++ b/keylime/web/verifier/session_controller.py
+@@ -1,27 +1,14 @@
+ import base64
+ 
+-from sqlalchemy.orm import Session
+-
+ from keylime import config, keylime_logging
+-from keylime.db.keylime_db import SessionManager, make_engine
+ from keylime.db.verifier_db import VerfierMain
+ from keylime.models.base import Timestamp
+ from keylime.models.verifier import AuthSession
++from keylime.models.verifier.auth_session import get_session_context
+ from keylime.web.base import Controller
+ 
+ logger = keylime_logging.init_logging("verifier")
+ 
+-# GLOBAL_POLICY_CACHE: Dict[str, Dict[str, str]] = {}
+-
+-_engine = None
+-
+-
+-def get_session() -> Session:
+-    global _engine
+-    if _engine is None:
+-        _engine = make_engine("cloud_verifier")
+-    return SessionManager().make_session(_engine)
+-
+ 
+ class SessionController(Controller):
+     # POST /v3[.:minor]/sessions
+@@ -198,8 +185,8 @@ class SessionController(Controller):
+             return
+ 
+         # Check if agent exists - this is where we validate enrollment
+-        session = get_session()
+-        agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
++        with get_session_context() as session:
++            agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
+ 
+         if not agent:
+             # Agent not enrolled - return 200 with evaluation:fail
+@@ -393,8 +380,8 @@ class SessionController(Controller):
+ 
+     # POST /v3[.:minor]/agents/:agent_id/session
+     def create(self, agent_id, **params):
+-        session = get_session()
+-        agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
++        with get_session_context() as session:
++            agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
+ 
+         if not agent:
+             self.respond(404, "here")
+@@ -416,8 +403,8 @@ class SessionController(Controller):
+         self.respond(200, "Success", auth_session.render())
+ 
+     def update(self, agent_id, token, **params):
+-        session = get_session()
+-        agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
++        with get_session_context() as session:
++            agent = session.query(VerfierMain).filter(VerfierMain.agent_id == agent_id).one_or_none()
+ 
+         # Look up session by token hash (tokens are never stored in plaintext)
+         auth_session = AuthSession.get_by_token(token)
+diff --git a/test/test_auth_session.py b/test/test_auth_session.py
+index 62b4244..8e9ec98 100644
+--- a/test/test_auth_session.py
++++ b/test/test_auth_session.py
+@@ -7,10 +7,41 @@ from unittest.mock import MagicMock, PropertyMock, patch
+ 
+ from keylime.crypto import generate_session_token, generate_token_salt, hash_token_for_storage
+ from keylime.models.base.types import Timestamp
+-from keylime.models.verifier.auth_session import AuthSession
++from keylime.models.verifier.auth_session import AuthSession, get_session_context
+ from keylime.shared_data import cleanup_global_shared_memory, get_shared_memory
+ 
+ 
++class TestGetSessionContext(unittest.TestCase):
++    """Test cases for get_session_context context manager."""
++
++    @patch("keylime.models.verifier.auth_session.make_engine")
++    @patch("keylime.models.verifier.auth_session.SessionManager")
++    def test_session_closed_on_normal_exit(self, mock_session_manager_cls, _mock_make_engine):
++        """Test that session.close() is called when context manager exits normally."""
++        mock_session = MagicMock()
++        mock_session_manager_cls.return_value.make_session.return_value = mock_session
++
++        with patch("keylime.models.verifier.auth_session._engine", None):
++            with get_session_context() as session:
++                self.assertIs(session, mock_session)
++
++            mock_session.close.assert_called_once()
++
++    @patch("keylime.models.verifier.auth_session.make_engine")
++    @patch("keylime.models.verifier.auth_session.SessionManager")
++    def test_session_closed_on_exception(self, mock_session_manager_cls, _mock_make_engine):
++        """Test that session.close() is called even when an exception occurs."""
++        mock_session = MagicMock()
++        mock_session_manager_cls.return_value.make_session.return_value = mock_session
++
++        with patch("keylime.models.verifier.auth_session._engine", None):
++            with self.assertRaises(RuntimeError):
++                with get_session_context():
++                    raise RuntimeError("simulated error")
++
++            mock_session.close.assert_called_once()
++
++
+ class TestAuthSessionHelpers(unittest.TestCase):
+     """Test cases for AuthSession helper methods."""
+ 
+@@ -398,7 +429,7 @@ class TestAuthSessionCore(unittest.TestCase):
+         self.assertIn("errors", result)
+         self.assertIn("authentication_supported", result["errors"])
+ 
+-    @patch("keylime.models.verifier.auth_session.get_session")
++    @patch("keylime.models.verifier.auth_session.get_session_context")
+     @patch.object(AuthSession, "get_by_token")
+     def test_authenticate_agent_success(self, mock_get_by_token, mock_get_session):
+         """Test successful agent authentication with valid token."""
+@@ -409,7 +440,8 @@ class TestAuthSessionCore(unittest.TestCase):
+         # Mock session query
+         mock_db_session = MagicMock()
+         mock_db_session.query.return_value.filter.return_value.one_or_none.return_value = mock_agent
+-        mock_get_session.return_value = mock_db_session
++        mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_db_session)
++        mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+ 
+         # Mock AuthSession.get_by_token to return an active session
+         mock_auth_session = MagicMock()
+diff --git a/test/test_session_controller.py b/test/test_session_controller.py
+index d807119..eec7fef 100644
+--- a/test/test_session_controller.py
++++ b/test/test_session_controller.py
+@@ -272,7 +272,7 @@ class TestSessionControllerUpdateSession(unittest.TestCase):
+         # Verify session was deleted from cache
+         self.assertNotIn(self.test_session_id, self.sessions_cache)
+ 
+-    @patch("keylime.web.verifier.session_controller.get_session")
++    @patch("keylime.web.verifier.session_controller.get_session_context")
+     def test_update_session_agent_not_enrolled(self, mock_get_session):
+         """Test update_session with unenrolled agent."""
+         # Create session in cache
+@@ -290,7 +290,8 @@ class TestSessionControllerUpdateSession(unittest.TestCase):
+         # Mock database query to return no agent
+         mock_session = MagicMock()
+         mock_session.query.return_value.filter.return_value.one_or_none.return_value = None
+-        mock_get_session.return_value = mock_session
++        mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
++        mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+ 
+         # Call update_session
+         params = {
+@@ -318,7 +319,7 @@ class TestSessionControllerUpdateSession(unittest.TestCase):
+         body = call_args[1]["body"]
+         self.assertEqual(body["data"]["attributes"]["evaluation"], "fail")
+ 
+-    @patch("keylime.web.verifier.session_controller.get_session")
++    @patch("keylime.web.verifier.session_controller.get_session_context")
+     @patch("keylime.models.verifier.auth_session.AuthSession.create_from_memory")
+     def test_update_session_authentication_failed(self, mock_create_from_memory, mock_get_session):
+         """Test update_session with failed authentication."""
+@@ -339,7 +340,8 @@ class TestSessionControllerUpdateSession(unittest.TestCase):
+         mock_agent.agent_id = self.test_agent_id
+         mock_session = MagicMock()
+         mock_session.query.return_value.filter.return_value.one_or_none.return_value = mock_agent
+-        mock_get_session.return_value = mock_session
++        mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
++        mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+ 
+         # Mock AuthSession.create_from_memory to return errors
+         mock_auth_session = MagicMock()
+@@ -377,7 +379,7 @@ class TestSessionControllerUpdateSession(unittest.TestCase):
+         call_args = self.controller.send_response.call_args  # type: ignore[attr-defined]
+         self.assertEqual(call_args[1]["code"], 401)
+ 
+-    @patch("keylime.web.verifier.session_controller.get_session")
++    @patch("keylime.web.verifier.session_controller.get_session_context")
+     @patch("keylime.models.verifier.auth_session.AuthSession.create_from_memory")
+     @patch("keylime.models.verifier.auth_session.AuthSession.delete_active_session_for_agent")
+     @patch("keylime.web.verifier.session_controller.config")
+@@ -403,7 +405,8 @@ class TestSessionControllerUpdateSession(unittest.TestCase):
+         mock_agent.agent_id = self.test_agent_id
+         mock_session = MagicMock()
+         mock_session.query.return_value.filter.return_value.one_or_none.return_value = mock_agent
+-        mock_get_session.return_value = mock_session
++        mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
++        mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+ 
+         # Mock config
+         mock_config.getboolean.return_value = False  # Don't keep in memory
+@@ -522,7 +525,7 @@ class TestSessionControllerLegacyEndpoints(unittest.TestCase):
+         self.assertEqual(call_args[0][0], 404)
+ 
+     @patch("keylime.models.verifier.auth_session.AuthSession.delete_stale")
+-    @patch("keylime.web.verifier.session_controller.get_session")
++    @patch("keylime.web.verifier.session_controller.get_session_context")
+     @patch("keylime.models.verifier.auth_session.AuthSession.create")
+     def test_create_success(self, mock_create, mock_get_session, _mock_delete_stale):
+         """Test successful create endpoint."""
+@@ -531,7 +534,8 @@ class TestSessionControllerLegacyEndpoints(unittest.TestCase):
+         mock_agent.agent_id = self.test_agent_id
+         mock_session = MagicMock()
+         mock_session.query.return_value.filter.return_value.one_or_none.return_value = mock_agent
+-        mock_get_session.return_value = mock_session
++        mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
++        mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+ 
+         # Mock AuthSession.create
+         mock_auth_session = MagicMock()
+@@ -549,13 +553,14 @@ class TestSessionControllerLegacyEndpoints(unittest.TestCase):
+         call_args = self.controller.respond.call_args  # type: ignore[attr-defined]
+         self.assertEqual(call_args[0][0], 200)
+ 
+-    @patch("keylime.web.verifier.session_controller.get_session")
++    @patch("keylime.web.verifier.session_controller.get_session_context")
+     def test_create_agent_not_found(self, mock_get_session):
+         """Test create endpoint with non-existent agent."""
+         # Mock database query to return None
+         mock_session = MagicMock()
+         mock_session.query.return_value.filter.return_value.one_or_none.return_value = None
+-        mock_get_session.return_value = mock_session
++        mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
++        mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+ 
+         # Call create
+         params = {"data": {}}
+@@ -566,7 +571,7 @@ class TestSessionControllerLegacyEndpoints(unittest.TestCase):
+         call_args = self.controller.respond.call_args  # type: ignore[attr-defined]
+         self.assertEqual(call_args[0][0], 404)
+ 
+-    @patch("keylime.web.verifier.session_controller.get_session")
++    @patch("keylime.web.verifier.session_controller.get_session_context")
+     @patch("keylime.models.verifier.auth_session.AuthSession.get_by_token")
+     def test_update_success(self, mock_get, mock_get_session):
+         """Test successful update endpoint."""
+@@ -575,7 +580,8 @@ class TestSessionControllerLegacyEndpoints(unittest.TestCase):
+         mock_agent.agent_id = self.test_agent_id
+         mock_session = MagicMock()
+         mock_session.query.return_value.filter.return_value.one_or_none.return_value = mock_agent
+-        mock_get_session.return_value = mock_session
++        mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
++        mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+ 
+         # Mock AuthSession.get_by_token
+         mock_auth_session = MagicMock()
+@@ -595,7 +601,7 @@ class TestSessionControllerLegacyEndpoints(unittest.TestCase):
+         call_args = self.controller.respond.call_args  # type: ignore[attr-defined]
+         self.assertEqual(call_args[0][0], 200)
+ 
+-    @patch("keylime.web.verifier.session_controller.get_session")
++    @patch("keylime.web.verifier.session_controller.get_session_context")
+     @patch("keylime.models.verifier.auth_session.AuthSession.get_by_token")
+     def test_update_not_found(self, mock_get, _mock_get_session):
+         """Test update endpoint with non-existent session."""
+-- 
+2.53.0
+

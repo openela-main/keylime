@@ -1,0 +1,46 @@
+From 416d3906fe4071132d5cdc494f828ce3a909f336 Mon Sep 17 00:00:00 2001
+From: Sergio Arroutbi <sarroutb@redhat.com>
+Date: Fri, 20 Mar 2026 10:57:23 +0100
+Subject: [PATCH] Remove enable_authentication agent config option
+
+The Rust agent does not parse the enable_authentication
+configuration option and always performs authentication.
+Remove the option from both the agent.j2 template and the
+2.5 mapping.json to avoid exposing a non-functional setting
+to users.
+
+Signed-off-by: Sergio Arroutbi <sarroutb@redhat.com>
+---
+ templates/2.5/agent.j2     | 7 -------
+ templates/2.5/mapping.json | 3 +--
+ 2 files changed, 1 insertion(+), 9 deletions(-)
+
+diff --git a/templates/2.5/agent.j2 b/templates/2.5/agent.j2
+index d5eec733d..5e9a1a706 100644
+--- a/templates/2.5/agent.j2
++++ b/templates/2.5/agent.j2
+@@ -274,10 +274,3 @@ ima_ml_path = "{{ agent.ima_ml_path }}"
+ # If set as a relative path, it will be considered from the root path "/".
+ # If set as an absolute path, it will use it without changes
+ measuredboot_ml_path = "{{ agent.measuredboot_ml_path }}"
+-
+-# Enable challenge-response authentication for push model attestation.
+-# When enabled, the agent will authenticate with the verifier using TPM-based
+-# proof of possession before sending attestation evidence.
+-# This option is specific to the push attestation model.
+-# The default is False (disabled).
+-enable_authentication = {{ agent.enable_authentication }}
+diff --git a/templates/2.5/mapping.json b/templates/2.5/mapping.json
+index 522aa4ce9..4b198e768 100644
+--- a/templates/2.5/mapping.json
++++ b/templates/2.5/mapping.json
+@@ -13,8 +13,7 @@
+                 "ima_ml_count_file": "/tmp/ima_ml_count",
+                 "uefi_logs_evidence_version": "1.0",
+                 "tls_accept_invalid_certs": "false",
+-                "tls_accept_invalid_hostnames": "false",
+-                "enable_authentication": "true"
++                "tls_accept_invalid_hostnames": "false"
+             }
+         },
+         "verifier": {

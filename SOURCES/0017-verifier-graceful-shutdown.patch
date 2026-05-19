@@ -1,0 +1,2373 @@
+From cb944ee9c178f7a717e904ddbf85aac5b27a2eac Mon Sep 17 00:00:00 2001
+From: rpm-build <rpm-build>
+Date: Fri, 17 Apr 2026 14:52:35 +0200
+Subject: [PATCH] verifier: Implement graceful shutdown
+
+Implement graceful shutdown, cancel pending retries, and drain in-flight
+work.
+
+Backported from https://github.com/keylime/keylime/pull/1869
+
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ docs/man/keylime_verifier.8.rst   |   1 +
+ docs/user_guide/configuration.rst |   6 +
+ keylime/cloud_verifier_tornado.py | 180 ++++++++++++---
+ keylime/push_agent_monitor.py     |  23 ++
+ keylime/revocation_notifier.py    |  10 +-
+ keylime/shared_data.py            |  65 +++++-
+ keylime/shutdown.py               |  21 ++
+ keylime/web/base/server.py        | 111 +++++++++-
+ keylime/web/verifier_server.py    | 122 +++++------
+ templates/2.6/agent.j2            | 313 ++++++++++++++++++++++++++
+ templates/2.6/ca.j2               |  39 ++++
+ templates/2.6/logging.j2          |  33 +++
+ templates/2.6/mapping.json        |  11 +
+ templates/2.6/registrar.j2        | 168 ++++++++++++++
+ templates/2.6/tenant.j2           | 130 +++++++++++
+ templates/2.6/verifier.j2         | 350 ++++++++++++++++++++++++++++++
+ test/test_shutdown.py             | 210 ++++++++++++++++++
+ test/test_verifier_server.py      |  82 +++----
+ 18 files changed, 1722 insertions(+), 153 deletions(-)
+ create mode 100644 keylime/shutdown.py
+ create mode 100644 templates/2.6/agent.j2
+ create mode 100644 templates/2.6/ca.j2
+ create mode 100644 templates/2.6/logging.j2
+ create mode 100644 templates/2.6/mapping.json
+ create mode 100644 templates/2.6/registrar.j2
+ create mode 100644 templates/2.6/tenant.j2
+ create mode 100644 templates/2.6/verifier.j2
+ create mode 100644 test/test_shutdown.py
+
+diff --git a/docs/man/keylime_verifier.8.rst b/docs/man/keylime_verifier.8.rst
+index 5303a5f..d22d211 100644
+--- a/docs/man/keylime_verifier.8.rst
++++ b/docs/man/keylime_verifier.8.rst
+@@ -53,6 +53,7 @@ Essentials:
+ - **quote_interval**: Time between integrity checks (seconds)
+ - **max_upload_size**: Upload size limit (bytes)
+ - **request_timeout**: Agent request timeout (seconds)
++- **shutdown_drain_timeout**: Max time (seconds) to wait for in-flight operations during shutdown
+ - **measured_boot_policy_name**, **measured_boot_imports**, **measured_boot_evaluate**: measured boot policy settings
+ - **severity_labels**, **severity_policy**: revocation severity config
+ - **ignore_tomtou_errors**: handle ToMToU IMA entries (bool)
+diff --git a/docs/user_guide/configuration.rst b/docs/user_guide/configuration.rst
+index aae5344..327c370 100644
+--- a/docs/user_guide/configuration.rst
++++ b/docs/user_guide/configuration.rst
+@@ -425,6 +425,10 @@ Common Options (Both Models)
+       - (empty)
+       - 2.5
+       - ``KEYLIME_VERIFIER_CERT_SUBJECT_ALTERNATIVE_NAMES``
++    * - ``shutdown_drain_timeout``
++      - ``10``
++      - 2.6
++      - ``KEYLIME_VERIFIER_SHUTDOWN_DRAIN_TIMEOUT``
+ 
+ Pull Model Specific Options
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+@@ -1097,6 +1101,8 @@ Configuration Version History
+       - Added ``api_versions`` for agent, ``malformed_cert_action`` for registrar
+     * - 2.5
+       - **Push model support**: Added ``mode``, ``challenge_lifetime``, ``verification_timeout``, session rate limiting and lifetime options for verifier; ``verifier_url``, ``agent_data_path``, TLS validation, exponential backoff options for agent. Added ``authorization_provider`` and ``cert_subject_alternative_names`` for verifier and registrar
++    * - 2.6
++      - Added ``shutdown_drain_timeout`` for verifier graceful shutdown
+ 
+ For detailed information on all configuration options for each component, refer
+ to the configuration files in ``/etc/keylime/`` and their inline documentation.
+diff --git a/keylime/cloud_verifier_tornado.py b/keylime/cloud_verifier_tornado.py
+index 75f117b..eb57de5 100644
+--- a/keylime/cloud_verifier_tornado.py
++++ b/keylime/cloud_verifier_tornado.py
+@@ -29,6 +29,7 @@ from keylime import (
+     keylime_logging,
+     push_agent_monitor,
+     revocation_notifier,
++    shutdown,
+     signing,
+     tornado_requests,
+     web_util,
+@@ -175,6 +176,29 @@ exclude_db: Dict[str, Any] = {
+ # events (quote polls, retries).  Used to cancel them all on shutdown.
+ _pending_events: Dict[str, object] = {}
+ 
++# Counter of currently executing process_agent() coroutines.  The shutdown
++# handler waits for this to reach zero before stopping the IOLoop so that
++# in-flight DB writes can finish.
++_active_operations = 0
++# Event signalled when _active_operations drops to zero during shutdown.
++_operations_drained = asyncio.Event()
++_operations_drained.set()  # initially no operations are active
++
++
++def _enter_operation() -> None:
++    """Increment the active operations counter."""
++    global _active_operations
++    _active_operations += 1
++    _operations_drained.clear()
++
++
++def _exit_operation() -> None:
++    """Decrement the active operations counter; signal if drained."""
++    global _active_operations
++    _active_operations -= 1
++    if _active_operations <= 0:
++        _operations_drained.set()
++
+ 
+ def _register_pending_event(agent: Dict[str, Any], handle: object) -> None:
+     """Track a pending IOLoop timeout in both the agent dict and the global registry.
+@@ -201,6 +225,38 @@ def _cancel_pending_event(agent: Dict[str, Any]) -> None:
+         logger.debug("Could not remove pending event for agent %s: %s", agent["agent_id"], e)
+ 
+ 
++def get_active_operations() -> int:
++    """Return the number of currently executing process_agent() coroutines."""
++    return _active_operations
++
++
++async def wait_for_drain(timeout: float) -> bool:
++    """Wait up to *timeout* seconds for all active operations to finish.
++
++    Returns True if all operations drained, False if the timeout expired.
++    """
++    try:
++        await asyncio.wait_for(_operations_drained.wait(), timeout=timeout)
++        return True
++    except asyncio.TimeoutError:
++        return False
++
++
++def cancel_all_pending_events() -> None:
++    """Cancel every tracked pending IOLoop timeout.  Called on shutdown."""
++    if not _pending_events:
++        return
++    io_loop = tornado.ioloop.IOLoop.current()
++    for agent_id, handle in _pending_events.items():
++        try:
++            io_loop.remove_timeout(handle)
++        except Exception as e:
++            logger.debug("Could not remove pending event for agent %s: %s", agent_id, e)
++    count = len(_pending_events)
++    _pending_events.clear()
++    logger.info("Cancelled %d pending attestation event(s) for shutdown", count)
++
++
+ def _from_db_obj(agent_db_obj: VerfierMain) -> Dict[str, Any]:
+     fields = [
+         "agent_id",
+@@ -2159,6 +2215,17 @@ async def invoke_get_quote(
+     need_pubkey: bool,
+     timeout: float = DEFAULT_TIMEOUT,
+ ) -> None:
++    # Clear tracking only — the timeout already fired (this *is* the callback),
++    # so there is no handle to cancel via remove_timeout().  Done before the
++    # shutdown check so tracking state is cleaned up even on early return.
++    if agent.get("pending_event") is not None:
++        agent["pending_event"] = None
++        _pending_events.pop(agent["agent_id"], None)
++
++    if shutdown.is_shutting_down():
++        logger.debug("Skipping get_quote for agent %s — shutting down", agent["agent_id"])
++        return
++
+     failure = Failure(Component.INTERNAL, ["verifier"])
+ 
+     params = cloud_verifier_common.prepare_get_quote(agent)
+@@ -2262,10 +2329,17 @@ async def invoke_get_quote(
+ 
+ 
+ async def invoke_provide_v(agent: Dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> None:
+-    failure = Failure(Component.INTERNAL, ["verifier"])
+-
++    # Clear tracking only — the timeout already fired (this *is* the callback),
++    # so there is no handle to cancel via remove_timeout().  Done before the
++    # shutdown check so tracking state is cleaned up even on early return.
+     if agent.get("pending_event") is not None:
+         agent["pending_event"] = None
++        _pending_events.pop(agent["agent_id"], None)
++
++    if shutdown.is_shutting_down():
++        logger.debug("Skipping provide_v for agent %s — shutting down", agent["agent_id"])
++        return
++    failure = Failure(Component.INTERNAL, ["verifier"])
+ 
+     v_json_message = cloud_verifier_common.prepare_v(agent)
+ 
+@@ -2422,6 +2496,14 @@ async def notify_error(
+ async def process_agent(
+     agent: Dict[str, Any], new_operational_state: int, failure: Failure = Failure(Component.INTERNAL, ["verifier"])
+ ) -> None:
++    # During shutdown, allow terminal-state transitions (FAILED, INVALID_QUOTE)
++    # through so that final DB writes and revocation notifications complete.
++    # Only skip non-terminal transitions that would schedule new polls/retries.
++    if shutdown.is_shutting_down() and new_operational_state not in (states.FAILED, states.INVALID_QUOTE):
++        logger.debug("Skipping process_agent for agent %s — shutting down", agent["agent_id"])
++        return
++
++    _enter_operation()
+     try:  # pylint: disable=R1702
+         main_agent_operational_state = agent["operational_state"]
+         stored_agent = None
+@@ -2452,15 +2534,13 @@ async def process_agent(
+         # if the stored agent could not be recovered from the database, stop polling
+         if not stored_agent:
+             logger.warning("Unable to retrieve agent %s from database. Stopping polling", agent["agent_id"])
+-            if agent["pending_event"] is not None:
+-                tornado.ioloop.IOLoop.current().remove_timeout(agent["pending_event"])
++            _cancel_pending_event(agent)
+             return
+ 
+         # if the user did terminated this agent
+         if stored_agent.operational_state == states.TERMINATED:  # pyright: ignore
+             logger.warning("Agent %s terminated by user.", agent["agent_id"])
+-            if agent["pending_event"] is not None:
+-                tornado.ioloop.IOLoop.current().remove_timeout(agent["pending_event"])
++            _cancel_pending_event(agent)
+ 
+             # Second database operation - delete agent
+             with session_context() as session:
+@@ -2470,8 +2550,7 @@ async def process_agent(
+         # if the user tells us to stop polling because the tenant quote check failed
+         if stored_agent.operational_state == states.TENANT_FAILED:  # pyright: ignore
+             logger.warning("Agent %s has failed tenant quote. Stopping polling", agent["agent_id"])
+-            if agent["pending_event"] is not None:
+-                tornado.ioloop.IOLoop.current().remove_timeout(agent["pending_event"])
++            _cancel_pending_event(agent)
+             return
+ 
+         # Use the request timeout stored in the agent dict (read from the
+@@ -2498,8 +2577,7 @@ async def process_agent(
+ 
+                 # When the failure is irrecoverable we stop polling the agent
+                 if not failure.recoverable or failure.highest_severity == MAX_SEVERITY_LABEL:
+-                    if agent["pending_event"] is not None:
+-                        tornado.ioloop.IOLoop.current().remove_timeout(agent["pending_event"])
++                    _cancel_pending_event(agent)
+ 
+                     # Third database operation - update agent with failure state
+                     with session_context() as session:
+@@ -2575,6 +2653,10 @@ async def process_agent(
+                     "Setting up callback to check agent ID %s again in %f seconds", agent["agent_id"], interval
+                 )
+ 
++                if shutdown.is_shutting_down():
++                    logger.debug("Not scheduling next poll for agent %s — shutting down", agent["agent_id"])
++                    return
++
+                 pending = tornado.ioloop.IOLoop.current().call_later(
+                     # type: ignore  # due to python <3.9
+                     interval,
+@@ -2585,7 +2667,7 @@ async def process_agent(
+                     False,
+                     timeout=timeout,
+                 )
+-                agent["pending_event"] = pending
++                _register_pending_event(agent, pending)
+             return
+ 
+         maxr = config.getint("verifier", "max_retries")
+@@ -2617,7 +2699,11 @@ async def process_agent(
+                     maxr,
+                     next_retry,
+                 )
+-                tornado.ioloop.IOLoop.current().call_later(
++                if shutdown.is_shutting_down():
++                    logger.debug("Not scheduling retry for agent %s — shutting down", agent["agent_id"])
++                    return
++
++                pending = tornado.ioloop.IOLoop.current().call_later(
+                     # type: ignore  # due to python <3.9
+                     next_retry,
+                     invoke_get_quote,
+@@ -2627,6 +2713,7 @@ async def process_agent(
+                     True,
+                     timeout=timeout,
+                 )
++                _register_pending_event(agent, pending)
+             return
+ 
+         if main_agent_operational_state == states.PROVIDE_V and new_operational_state == states.PROVIDE_V_RETRY:
+@@ -2651,9 +2738,17 @@ async def process_agent(
+                     maxr,
+                     next_retry,
+                 )
+-                tornado.ioloop.IOLoop.current().call_later(
+-                    next_retry, invoke_provide_v, agent  # type: ignore  # due to python <3.9
++                if shutdown.is_shutting_down():
++                    logger.debug("Not scheduling retry for agent %s — shutting down", agent["agent_id"])
++                    return
++
++                pending = tornado.ioloop.IOLoop.current().call_later(
++                    next_retry,  # type: ignore  # due to python <3.9
++                    invoke_provide_v,
++                    agent,
++                    timeout,
+                 )
++                _register_pending_event(agent, pending)
+             return
+         raise Exception("nothing should ever fall out of this!")
+ 
+@@ -2663,6 +2758,8 @@ async def process_agent(
+             "exception", {"context": "Agent caused the verifier to throw an exception", "data": str(e)}, False
+         )
+         await process_agent(agent, states.FAILED, failure)
++    finally:
++        _exit_operation()
+ 
+ 
+ async def activate_agents(agents: List[VerfierMain], verifier_ip: str, verifier_port: int) -> None:
+@@ -2769,31 +2866,62 @@ def main() -> None:
+         server = tornado.httpserver.HTTPServer(app, ssl_options=ssl_ctx, max_buffer_size=max_upload_size)
+         server.add_sockets(sockets)
+ 
+-        def server_sig_handler(*_: Any) -> None:
+-            logger.info("Shutting down server %s..", task_id)
++        # Hold strong references to async tasks to prevent GC from collecting them mid-run
++        _background_tasks: List[asyncio.Task[None]] = []
++
++        def server_sig_handler(signame: str = "signal") -> None:
++            if shutdown.is_shutting_down():
++                logger.warning("Shutdown already in progress, ignoring %s (server %s)", signame, task_id)
++                return
++            logger.info("Received %s, shutting down server %s..", signame, task_id)
++
++            # Signal all attestation loops to stop scheduling new work
++            shutdown.request_shutdown()
++
+             # Stop server to not accept new incoming connections
+             server.stop()
+ 
+-            # Gracefully shutdown webhook workers to prevent connection errors
+-            if "webhook" in revocation_notifier.get_notifiers():
+-                revocation_notifier.shutdown_webhook_workers()
++            # Cancel all pending attestation timeouts (retries, polls)
++            cancel_all_pending_events()
++            push_agent_monitor.cancel_all_timeouts()
+ 
+-            # Wait for all connections to be closed and then stop ioloop
++            # Wait for in-flight operations, then close connections and stop
+             async def stop() -> None:
+-                await server.close_all_connections()
+-                tornado.ioloop.IOLoop.current().stop()
++                try:
++                    # Give in-flight process_agent() coroutines time to finish
++                    # DB writes and revocation notifications before tearing
++                    # down webhook workers.
++                    drain_timeout = config.getfloat("verifier", "shutdown_drain_timeout", fallback=10.0)
++                    drained = await wait_for_drain(drain_timeout)
++                    if not drained:
++                        logger.warning(
++                            "Shutting down with %d operation(s) still active after %.1fs",
++                            get_active_operations(),
++                            drain_timeout,
++                        )
++
++                    # Shutdown webhook workers after draining so revocation
++                    # notifications from in-flight attestations are delivered.
++                    if "webhook" in revocation_notifier.get_notifiers():
++                        revocation_notifier.shutdown_webhook_workers()
++
++                    await server.close_all_connections()
++                except Exception:
++                    logger.exception("Error during shutdown cleanup")
++                finally:
++                    tornado.ioloop.IOLoop.current().stop()
+ 
+-            asyncio.ensure_future(stop())
++            _background_tasks.append(asyncio.ensure_future(stop()))
+ 
+         # Attach signal handler to ioloop.
+         # Do not use signal.signal(..) for that because it does not work!
+         loop = asyncio.get_event_loop()
+-        loop.add_signal_handler(signal.SIGINT, server_sig_handler)
+-        loop.add_signal_handler(signal.SIGTERM, server_sig_handler)
++        loop.add_signal_handler(signal.SIGINT, lambda: server_sig_handler("SIGINT"))
++        loop.add_signal_handler(signal.SIGTERM, lambda: server_sig_handler("SIGTERM"))
+ 
+         server.start()
+         # Reactivate agents
+-        asyncio.ensure_future(activate_agents(agents, verifier_host, int(verifier_port)))
++        _background_tasks.append(asyncio.ensure_future(activate_agents(agents, verifier_host, int(verifier_port))))
+         tornado.ioloop.IOLoop.current().start()
+         logger.debug("Server %s stopped.", task_id)
+         sys.exit(0)
+diff --git a/keylime/push_agent_monitor.py b/keylime/push_agent_monitor.py
+index f41befc..6537a31 100644
+--- a/keylime/push_agent_monitor.py
++++ b/keylime/push_agent_monitor.py
+@@ -171,6 +171,29 @@ def cancel_agent_timeout(agent_id: str) -> None:
+             logger.error("Error cancelling timeout for agent %s: %s", agent_id, e)
+ 
+ 
++def cancel_all_timeouts() -> None:
++    """Cancel all scheduled PUSH mode agent timeouts.
++
++    Called during shutdown to prevent timeout callbacks from firing
++    against a stopping event loop.
++    """
++    with _agent_timeout_handles_lock:
++        handles = dict(_agent_timeout_handles)
++        _agent_timeout_handles.clear()
++
++    if not handles:
++        return
++
++    io_loop = tornado.ioloop.IOLoop.current()
++    for agent_id, handle in handles.items():
++        try:
++            io_loop.remove_timeout(handle)
++        except Exception as e:
++            logger.debug("Could not remove timeout for agent %s during shutdown: %s", agent_id, e)
++
++    logger.info("Cancelled %d PUSH mode agent timeout(s) for shutdown", len(handles))
++
++
+ def check_push_agent_timeouts() -> None:
+     """Check all PUSH mode agents for timeouts and mark failed ones.
+ 
+diff --git a/keylime/revocation_notifier.py b/keylime/revocation_notifier.py
+index abab08b..f7efece 100644
+--- a/keylime/revocation_notifier.py
++++ b/keylime/revocation_notifier.py
+@@ -259,9 +259,13 @@ def stop_broker() -> None:
+ 
+ 
+ def shutdown_webhook_workers() -> None:
+-    """Convenience function to shutdown webhook workers using the global manager."""
+-    manager = _get_webhook_manager()
+-    manager.shutdown_workers()
++    """Shutdown webhook workers if the manager was ever initialized.
++
++    If no revocation notifications were sent in this process, the manager
++    is still None and there is nothing to shut down.
++    """
++    if _webhook_manager is not None:
++        _webhook_manager.shutdown_workers()
+ 
+ 
+ def notify(tosend: Dict[str, Any]) -> None:
+diff --git a/keylime/shared_data.py b/keylime/shared_data.py
+index a415496..09cbb97 100644
+--- a/keylime/shared_data.py
++++ b/keylime/shared_data.py
+@@ -6,6 +6,8 @@ using multiprocessing.Manager().
+ 
+ import atexit
+ import multiprocessing as mp
++import multiprocessing.process
++import os
+ import threading
+ import time
+ from typing import Any, Dict, List, Optional
+@@ -137,8 +139,6 @@ class SharedDataManager:
+         # Register handler to reinitialize manager connection after fork
+         # This is needed because Manager uses network connections that don't survive fork
+         try:
+-            import os  # pylint: disable=import-outside-toplevel
+-
+             self._parent_pid = os.getpid()
+             logger.debug("SharedDataManager initialized in process %d", self._parent_pid)
+         except Exception as e:
+@@ -283,15 +283,48 @@ class SharedDataManager:
+         """Cleanup shared resources.
+ 
+         This is automatically called on exit but can be called manually
+-        for explicit cleanup.
++        for explicit cleanup.  Only the parent process (the one that
++        created the Manager) is allowed to shut it down; child workers
++        forked from the parent skip the call to avoid the
++        ``AssertionError: can only join a child process`` raised by
++        ``multiprocessing`` when a non-parent tries to join.
+         """
+-        if hasattr(self, "_manager"):
+-            logger.debug("Shutting down SharedDataManager")
+-            try:
+-                self._manager.shutdown()
+-                logger.info("SharedDataManager shutdown complete")
+-            except Exception as e:
+-                logger.error("Error during SharedDataManager shutdown: %s", e)
++        if not hasattr(self, "_manager"):
++            return
++
++        if hasattr(self, "_parent_pid") and os.getpid() != self._parent_pid:
++            logger.debug(
++                "Skipping SharedDataManager shutdown in child process %d (parent is %d)",
++                os.getpid(),
++                self._parent_pid,
++            )
++            return
++
++        logger.debug("Shutting down SharedDataManager")
++        try:
++            self._manager.shutdown()
++            logger.info("SharedDataManager shutdown complete")
++        except Exception:
++            logger.exception("Error during SharedDataManager shutdown")
++
++    def deregister_child(self) -> None:
++        """Remove the Manager's server process from multiprocessing's child tracking.
++
++        Must be called in each forked worker **after** ``fork()``.  Without
++        this, Python's ``multiprocessing.util._exit_function`` atexit handler
++        tries to ``join()`` the Manager server process in every child worker,
++        causing ``AssertionError: can only join a child process`` because the
++        Manager was spawned by the parent, not the child.
++        """
++        # The Manager's server process is stored in _manager._process
++        server_process = getattr(self._manager, "_process", None)
++        if server_process is not None:
++            multiprocessing.process._children.discard(server_process)  # type: ignore[attr-defined]  # pylint: disable=protected-access
++            logger.debug(
++                "Deregistered Manager server process (pid %s) from child tracking in worker %d",
++                getattr(server_process, "pid", "?"),
++                os.getpid(),
++            )
+ 
+     def __repr__(self) -> str:
+         stats = self.get_stats()
+@@ -364,6 +397,18 @@ def get_shared_memory() -> SharedDataManager:
+     return _global_shared_manager
+ 
+ 
++def deregister_shared_memory_child() -> None:
++    """Deregister the Manager's server process in a forked child worker.
++
++    Call this after ``tornado.process.fork_processes()`` (or any ``fork()``)
++    to prevent Python's atexit handler from trying to ``join()`` the Manager
++    server process in the child, which would raise
++    ``AssertionError: can only join a child process``.
++    """
++    if _global_shared_manager is not None:
++        _global_shared_manager.deregister_child()
++
++
+ def cleanup_global_shared_memory() -> None:
+     """Cleanup the global shared memory manager.
+ 
+diff --git a/keylime/shutdown.py b/keylime/shutdown.py
+new file mode 100644
+index 0000000..72f1c76
+--- /dev/null
++++ b/keylime/shutdown.py
+@@ -0,0 +1,21 @@
++"""Shutdown coordination for graceful server termination.
++
++Provides a process-wide shutdown flag that attestation loops and retry
++schedulers check before starting new work.  Setting the flag prevents
++new IOLoop callbacks from being scheduled and allows in-flight
++operations to drain before the event loop stops.
++"""
++
++import asyncio
++
++_shutdown_event = asyncio.Event()
++
++
++def request_shutdown() -> None:
++    """Signal that the process is shutting down."""
++    _shutdown_event.set()
++
++
++def is_shutting_down() -> bool:
++    """Return True if shutdown has been requested."""
++    return _shutdown_event.is_set()
+diff --git a/keylime/web/base/server.py b/keylime/web/base/server.py
+index b62debd..7c8a71b 100644
+--- a/keylime/web/base/server.py
++++ b/keylime/web/base/server.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import multiprocessing
++import signal
+ from abc import ABC, abstractmethod
+ from functools import wraps
+ from ssl import CERT_OPTIONAL
+@@ -7,8 +8,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
+ 
+ import tornado
+ 
+-from keylime import api_version, config, keylime_logging, web_util
++from keylime import api_version, config, keylime_logging, shutdown, web_util
+ from keylime.models.base.db import db_manager
++from keylime.shared_data import deregister_shared_memory_child
+ from keylime.web.base.action_handler import ActionHandler
+ from keylime.web.base.route import Route
+ 
+@@ -251,6 +253,8 @@ class Server(ABC):
+         # Tornado servers are instantiated by calling start_single() or start_multi(), so set to None initially
+         self.__tornado_http_server: Optional[tornado.httpserver.HTTPServer] = None
+         self.__tornado_https_server: Optional[tornado.httpserver.HTTPServer] = None
++        self._server_stopped: Optional[asyncio.Event] = None
++        self._shutdown_task: Optional[asyncio.Task[None]] = None
+ 
+     async def start_single(self) -> None:
+         """Instantiates and starts the server (with one Tornado HTTPServer instance to handle HTTP connections
+@@ -273,7 +277,82 @@ class Server(ABC):
+             https_server.add_sockets(self.__tornado_https_sockets)
+             self.__tornado_https_server = https_server
+ 
+-        await asyncio.Event().wait()
++        # Create the stop event before installing signal handlers so that
++        # _graceful_shutdown() can always set it, even if a signal arrives
++        # before we reach the wait().
++        self._server_stopped = asyncio.Event()
++
++        # Install signal handlers for graceful shutdown
++        self._install_signal_handlers()
++
++        try:
++            # Hook for subclasses to perform work after servers are listening
++            # but before blocking (e.g. activate agents).
++            await self._on_server_started()
++            await self._server_stopped.wait()
++        finally:
++            # Remove signal handlers before returning to asyncio.run()'s
++            # teardown, which closes the wakeup fd and replaces remaining
++            # handlers with _sighandler_noop.  Any signal arriving after
++            # that would write to the closed fd, causing
++            # "OSError: Bad file descriptor".
++            self._remove_signal_handlers()
++
++    async def _on_server_started(self) -> None:
++        """Called after servers are listening but before blocking.
++
++        Override in subclasses to perform post-startup work such as
++        activating agents.  The default implementation does nothing.
++        """
++
++    def _install_signal_handlers(self) -> None:
++        """Install SIGINT/SIGTERM handlers for graceful shutdown."""
++        loop = asyncio.get_event_loop()
++
++        async def _run_graceful_shutdown() -> None:
++            try:
++                await self._graceful_shutdown()
++            except Exception:
++                logger.exception("Graceful shutdown failed")
++            finally:
++                if self._server_stopped is not None:
++                    self._server_stopped.set()
++
++        def _make_handler(signame: str) -> Callable[[], None]:
++            def _handler() -> None:
++                if shutdown.is_shutting_down():
++                    logger.warning("Shutdown already in progress, ignoring %s", signame)
++                    return
++                logger.info("Received %s, shutting down", signame)
++                shutdown.request_shutdown()
++                self._shutdown_task = asyncio.ensure_future(_run_graceful_shutdown())
++
++            return _handler
++
++        loop.add_signal_handler(signal.SIGINT, _make_handler("SIGINT"))
++        loop.add_signal_handler(signal.SIGTERM, _make_handler("SIGTERM"))
++
++    def _remove_signal_handlers(self) -> None:
++        """Remove SIGINT/SIGTERM handlers from the event loop."""
++        loop = asyncio.get_event_loop()
++        loop.remove_signal_handler(signal.SIGINT)
++        loop.remove_signal_handler(signal.SIGTERM)
++
++    async def _graceful_shutdown(self) -> None:
++        """Stop servers and close connections gracefully.
++
++        Subclasses can override this to cancel component-specific pending work
++        before calling super().
++        """
++        if self.__tornado_http_server:
++            self.__tornado_http_server.stop()
++        if self.__tornado_https_server:
++            self.__tornado_https_server.stop()
++
++        if self.__tornado_http_server:
++            await self.__tornado_http_server.close_all_connections()
++        if self.__tornado_https_server:
++            await self.__tornado_https_server.close_all_connections()
+ 
+     def start_multi(self) -> None:
+         ports = ""
+@@ -295,12 +374,19 @@ class Server(ABC):
+             self.worker_count,
+         )
+ 
++        self._pre_fork()
++
+         # with StatsCollector():
+         # num = manager.Value('i', 0)
+-        tornado.process.fork_processes(self.worker_count)
++        task_id = tornado.process.fork_processes(self.worker_count)
+         # num.value = num.value + 1
+         # print(num.value)
+ 
++        # Remove the Manager's server process from multiprocessing's child
++        # tracking so Python's atexit handler does not try to join() it in
++        # child workers (the Manager was spawned by the parent).
++        deregister_shared_memory_child()
++
+         # Dispose inherited db_manager engine after fork to avoid sharing the
+         # parent's connection pool, then re-create with a fresh pool for this
+         # child process.
+@@ -309,8 +395,27 @@ class Server(ABC):
+         if service:
+             db_manager.make_engine(service)
+ 
++        self._post_fork(task_id)
++
+         asyncio.run(self.start_single())
+ 
++    def _pre_fork(self) -> None:
++        """Called before ``fork_processes()`` in ``start_multi()``.
++
++        Override in subclasses to perform work that must happen in the
++        parent process before forking (e.g. querying the database for
++        agent lists to distribute across workers).
++        """
++
++    def _post_fork(self, task_id: int) -> None:
++        """Called after ``fork_processes()`` in each child worker.
++
++        *task_id* is the worker index returned by Tornado's
++        ``fork_processes()``.  Override to perform per-worker
++        initialization (e.g. resetting inherited DB state, distributing
++        agents).
++        """
++
+     def _setup(self) -> None:
+         """Defines values to use in place of the defaults for the various server options. It is suggested that this is
+         overriden by the implementing class."""
+diff --git a/keylime/web/verifier_server.py b/keylime/web/verifier_server.py
+index 6a0261c..1ada86e 100755
+--- a/keylime/web/verifier_server.py
++++ b/keylime/web/verifier_server.py
+@@ -1,12 +1,16 @@
+ import asyncio
+ from typing import List, Optional
+ 
+-import tornado.httpserver
+-import tornado.ioloop
+-import tornado.process
+ from sqlalchemy.exc import SQLAlchemyError
+ 
+-from keylime import cloud_verifier_common, cloud_verifier_tornado, config, keylime_logging
++from keylime import (
++    cloud_verifier_common,
++    cloud_verifier_tornado,
++    config,
++    keylime_logging,
++    push_agent_monitor,
++    revocation_notifier,
++)
+ from keylime.authorization.provider import Action
+ from keylime.common import states
+ from keylime.db.keylime_db import SessionManager, make_engine
+@@ -30,82 +34,76 @@ class VerifierServer(Server):
+         super().__init__()
+         self._prepare_agents_on_startup()
+         self._clear_stale_sessions_on_startup()
++        self._all_agents: List[VerfierMain] = []
+         self._worker_agents: Optional[List[VerfierMain]] = None
++        self._activate_task: Optional[asyncio.Task[None]] = None
+ 
+-    def start_multi(self) -> None:  # pylint: disable=no-member
+-        """Override to support PULL mode agent activation across multiple workers."""
+-        # Get all agents from database before forking (only needed for PULL mode)
++    def _pre_fork(self) -> None:
++        """Query agents from database before forking (only needed for PULL mode)."""
+         logger.info("start_multi() called with operating_mode: %s", self.operating_mode)
+-        all_agents: List[VerfierMain] = []
++        self._all_agents = []
+         if self.operating_mode == "pull":
+             verifier_id = config.get("verifier", "uuid", fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
+             logger.info("Querying agents for verifier_id: %s", verifier_id)
+-            all_agents = cloud_verifier_tornado.get_agents_by_verifier_id(verifier_id)
+-            logger.info("Found %d agents in database before forking", len(all_agents))
+-
+-        # Log server startup (copied from base class)
+-        ports = ""
+-        protocols = ""
+-        if self._Server__tornado_http_sockets:  # type: ignore # pylint: disable=no-member
+-            ports = str(self.http_port)
+-            protocols = "HTTP"
+-        if self._Server__tornado_https_sockets and self.ssl_ctx:  # type: ignore # pylint: disable=no-member
+-            ports = f"{ports}/{self.https_port}" if ports else f"{self.https_port}"
+-            protocols = f"{protocols}/S" if protocols else "HTTPS"
+-        logger.info(
+-            "Listening on %s:%s (%s) with %s worker processes...",
+-            self.bind_interface,
+-            ports,
+-            protocols,
+-            self.worker_count,
+-        )
+-
+-        # Fork worker processes - returns task_id in each child process
+-        task_id = tornado.process.fork_processes(self.worker_count)
++            self._all_agents = cloud_verifier_tornado.get_agents_by_verifier_id(verifier_id)
++            logger.info("Found %d agents in database before forking", len(self._all_agents))
+ 
++    def _post_fork(self, task_id: int) -> None:
++        """Reset inherited DB state and distribute agents to this worker."""
+         # CRITICAL: Reset any database state inherited from parent process.
+-        # The parent initializes globals when querying agents (line 39), so children
+-        # inherit initialized state. We must reset to trigger lazy re-initialization.
++        # The parent initializes globals when querying agents in _pre_fork(),
++        # so children inherit initialized state. We must reset to trigger
++        # lazy re-initialization.
+         cloud_verifier_tornado.reset_verifier_config()
+ 
+         # Distribute agents to this worker using round-robin (task_id is the worker index)
+-        if self.operating_mode == "pull" and all_agents:
+-            self._worker_agents = [all_agents[i] for i in range(task_id, len(all_agents), self.worker_count)]
++        if self.operating_mode == "pull" and self._all_agents:
++            self._worker_agents = [
++                self._all_agents[i] for i in range(task_id, len(self._all_agents), self.worker_count)
++            ]
+             logger.info("Worker %d assigned %d agent(s)", task_id, len(self._worker_agents))
+ 
+-        # Start this worker's HTTP/HTTPS servers and activate agents
+-        self.start_single()
+-
+-    def start_single(self) -> None:  # type: ignore[override]  # pylint: disable=attribute-defined-outside-init,invalid-overridden-method
+-        """Override to support PULL mode agent activation after server startup."""
+-        # Start HTTP/HTTPS servers (logic copied from parent to allow agent activation before blocking)
+-        # pylint: disable=no-member
+-        if self._Server__tornado_http_sockets:  # type: ignore
+-            http_server = tornado.httpserver.HTTPServer(
+-                self._Server__tornado_app, ssl_options=None, max_buffer_size=self.max_upload_size  # type: ignore
++    async def _on_server_started(self) -> None:
++        """Activate agents for PULL mode after servers are listening."""
++        # In start_single() mode (single-process), _pre_fork/_post_fork
++        # are never called so _worker_agents is None and _all_agents is
++        # empty.  Query agents directly in that case.
++        agents = self._worker_agents if self._worker_agents is not None else self._all_agents
++        if self.operating_mode == "pull" and not agents and self._worker_agents is None:
++            verifier_id = config.get("verifier", "uuid", fallback=cloud_verifier_common.DEFAULT_VERIFIER_ID)
++            agents = cloud_verifier_tornado.get_agents_by_verifier_id(verifier_id)
++        if self.operating_mode == "pull" and agents:
++            verifier_host = config.get("verifier", "ip")
++            verifier_port = config.get("verifier", "port")
++            logger.info("Activating %d agent(s) for PULL mode", len(agents))
++            self._activate_task = asyncio.ensure_future(
++                cloud_verifier_tornado.activate_agents(agents, verifier_host, int(verifier_port))
+             )
+-            http_server.add_sockets(self._Server__tornado_http_sockets)  # type: ignore
+-            self._Server__tornado_http_server = http_server  # type: ignore # pylint: disable=attribute-defined-outside-init
+ 
+-        if self._Server__tornado_https_sockets and self.ssl_ctx:  # type: ignore
+-            https_server = tornado.httpserver.HTTPServer(
+-                self._Server__tornado_app, ssl_options=self.ssl_ctx, max_buffer_size=self.max_upload_size  # type: ignore
++    async def _graceful_shutdown(self) -> None:
++        """Cancel attestation-specific pending work and drain in-flight operations before stopping servers."""
++        # Cancel all pending attestation timeouts (retries, polls)
++        cloud_verifier_tornado.cancel_all_pending_events()
++        push_agent_monitor.cancel_all_timeouts()
++
++        # Wait for in-flight attestation operations to complete before
++        # tearing down webhook workers — in-flight process_agent() calls
++        # may still need to send revocation notifications.
++        drain_timeout = config.getfloat("verifier", "shutdown_drain_timeout", fallback=10.0)
++        drained = await cloud_verifier_tornado.wait_for_drain(drain_timeout)
++        if not drained:
++            logger.warning(
++                "Shutting down with %d attestation operation(s) still active after %.1fs",
++                cloud_verifier_tornado.get_active_operations(),
++                drain_timeout,
+             )
+-            https_server.add_sockets(self._Server__tornado_https_sockets)  # type: ignore
+-            self._Server__tornado_https_server = https_server  # type: ignore # pylint: disable=attribute-defined-outside-init
+-        # pylint: enable=no-member
+ 
+-        # Activate agents for PULL mode
+-        if self.operating_mode == "pull" and self._worker_agents:
+-            verifier_host = config.get("verifier", "ip")
+-            verifier_port = config.get("verifier", "port")
+-            logger.info("Activating %d agent(s) for PULL mode", len(self._worker_agents))
+-            asyncio.ensure_future(
+-                cloud_verifier_tornado.activate_agents(self._worker_agents, verifier_host, int(verifier_port))
+-            )
++        # Shutdown webhook workers after draining so revocation
++        # notifications from in-flight attestations are delivered.
++        if "webhook" in revocation_notifier.get_notifiers():
++            revocation_notifier.shutdown_webhook_workers()
+ 
+-        # Wait forever (until event loop is stopped)
+-        tornado.ioloop.IOLoop.current().start()
++        await super()._graceful_shutdown()
+ 
+     def _prepare_agents_on_startup(self) -> None:
+         """Prepare agents in database for verifier startup.
+diff --git a/templates/2.6/agent.j2 b/templates/2.6/agent.j2
+new file mode 100644
+index 0000000..26d5b7c
+--- /dev/null
++++ b/templates/2.6/agent.j2
+@@ -0,0 +1,313 @@
++# Keylime agent configuration
++# The Python agent is deprecated and will be removed with the next major release (7.0.0)!
++# Please migrate to the Rust based agent: https://github.com/keylime/rust-keylime/
++[agent]
++
++# The configuration file version number
++version = "{{ agent.version }}"
++
++# The enabled API versions
++# This sets which of the supported API versions to enable.
++# Only supported versions can be set, which are defined by
++# api::SUPPORTED_API_VERSIONS
++# A list of versions to enable can be provided (e.g. "2.1, 2.2")
++# The following keywords are also supported:
++# - "default": Enables all supported API versions
++# - "latest": Enables only the latest supported API version
++api_versions = "{{ agent.api_versions }}"
++
++# The agent's UUID.
++# If you set this to "generate", Keylime will create a random UUID.
++# If you set this to "hash_ek", Keylime will set the UUID to the result
++# of 'SHA256(public EK in PEM format)'.
++# If you set this to "environment", Keylime will use the value of the
++# environment variable "KEYLIME_AGENT_UUID" as UUID.
++# If you set this to "dmidecode", Keylime will use the UUID from
++# 'dmidecode -s system-uuid'.
++# If you set this to "hostname", Keylime will use the full qualified domain
++# name of current host as the agent id.
++uuid = "{{ agent.uuid }}"
++
++# The binding address and port for the agent server
++ip = "{{ agent.ip }}"
++port = {{ agent.port }}
++
++# Address and port where the verifier and tenant can connect to reach the agent.
++# These keys are optional.
++contact_ip = "{{ agent.contact_ip }}"
++contact_port = {{ agent.contact_port }}
++
++# Path to store agent persistent data
++agent_data_path = "{{ agent_data_path }}"
++
++# Verifier Information (Push Model specific).
++# Verifier URL
++verifier_url = "{{ agent_verifier_url }}"
++
++# Verifier TLS CA certificate (Push Model specific).
++# Used to verify the verifier's server certificate.
++# If set as "default", the "cv_ca/cacert.crt" value relative to keylime_dir is used.
++verifier_tls_ca_cert = "{{ agent.verifier_tls_ca_cert }}"
++
++# Server identifier for certification keys
++certification_keys_server_identifier = "{{ agent_certification_keys_server_identifier }}"
++
++# Evidence version for UEFI logs
++uefi_logs_evidence_version = "{{ agent_uefi_logs_evidence_version }}"
++
++# The address and port of the registrar server which the agent communicates with
++registrar_ip = "{{ agent.registrar_ip }}"
++registrar_port = {{ agent.registrar_port }}
++
++# The TLS port of the registrar server (Push Model specific).
++# Used when registrar_tls_enabled is set to true.
++registrar_tls_port = {{ agent.registrar_tls_port }}
++
++# Enable TLS communication between agent and registrar (Push Model specific).
++# When enabled, the agent uses TLS (server verification only) with the registrar.
++registrar_tls_enabled = {{ agent.registrar_tls_enabled }}
++
++# TLS CA certificate for verifying the registrar's server certificate (Push Model specific).
++# Only used when registrar_tls_enabled is true.
++# If set as "default", the "cv_ca/cacert.crt" value relative to keylime_dir is used.
++registrar_tls_ca_cert = "{{ agent.registrar_tls_ca_cert }}"
++
++# The API versions to use when communicating with the registrar (Push Model specific).
++# Supports "default" (all supported), "latest", or a comma-separated list.
++registrar_api_versions = "{{ agent.registrar_api_versions }}"
++
++# Enable mTLS communication between agent, verifier and tenant.
++# Details on why setting it to "False" is generally considered insecure can be found
++# on https://github.com/keylime/keylime/security/advisories/GHSA-2m39-75g9-ff5r
++enable_agent_mtls = {{ agent.enable_agent_mtls }}
++
++# The keylime working directory.
++keylime_dir = "{{ agent.keylime_dir }}"
++
++# Accept invalid TLS certificates (INSECURE - for testing only)
++# When enabled, the agent will accept self-signed or invalid certificates
++# This option is specific to the push attestation model.
++# This should ONLY be used for testing or development environments
++# Default: False (secure)
++tls_accept_invalid_certs = {{ agent.tls_accept_invalid_certs }}
++
++# Accept invalid TLS hostnames (INSECURE - for testing only)
++# When enabled, the agent will accept certificates with mismatched hostnames
++# This option is specific to the push attestation model.
++# This should ONLY be used for testing or development environments
++# Default: False (secure)
++tls_accept_invalid_hostnames = {{ agent.tls_accept_invalid_hostnames }}
++
++# The 'tls_dir' option defines the directory where the keys and certificates are
++# stored.
++#
++# If set as 'generate', automatically generate a CA, keys, and certificates for
++# the client and the server in the /var/lib/keylime/cv_ca directory, if not
++# present.
++#
++# The 'server_key', 'server_cert', and 'trusted_client_ca' options should all be
++# set with the 'default' keyword when 'generate' keyword is set for 'tls_dir'.
++#
++# If set as 'default', the '/var/lib/keylime/secure' directory is used, which
++# should contain the files indicated by the 'server_key', 'server_cert',
++# and 'trusted_client_ca' options.
++tls_dir = "{{ agent.tls_dir }}"
++
++# The name of the file containing the Keylime agent TLS server private key.
++# This private key is used to serve the Keylime agent REST API
++# A new private key is generated in case it is not found.
++# If set as 'default', the 'server-private.pem' value is used.
++server_key = "{{ agent.server_key }}"
++
++# Set the password used to decrypt the private key file.
++# This password will also be used to protect the generated private key used for
++# mTLS authentication
++# If left empty, the private key will not be encrypted.
++server_key_password = "{{ agent.server_key_password }}"
++
++# The name of the file containing the payload encryption private key.
++# If set as "default", the "payload-private.pem" value is used.
++payload_key = "{{ agent.payload_key }}"
++
++# Set the password used to encrypt the payload private key file.
++# If left empty, the private key will not be encrypted.
++payload_key_password = "{{ agent.payload_key_password }}"
++
++# The name of the file containing the X509 certificate used as the Keylime agent
++# server TLS certificate.
++# This certificate must be self signed.
++server_cert = "{{ agent.server_cert }}"
++
++# A list of trusted client CA certificates
++trusted_client_ca = "{{ agent.trusted_client_ca }}"
++
++# The name of the file used to store the payload encryption key, derived from
++# the U and V parts.
++# This file is stored in the /var/lib/keylime/secure/ directory.
++enc_keyname = "{{ agent.enc_keyname }}"
++
++# The name of the file used to store the optional decrypted payload.
++# This file is stored in the /var/lib/keylime/secure/ directory.
++dec_payload_file = "{{ agent.dec_payload_file }}"
++
++# The size of the memory-backed tmpfs partition where Keylime stores keys and
++# the decrypted payload.
++# Use syntax that the 'mount' command would accept as a size parameter for tmpfs.
++# The default below sets it to 1 megabyte.
++secure_size =  "{{ agent.secure_size }}"
++
++# Use this option to set the TPM ownerpassword to something you want to use.
++# Set it to "generate" if you want Keylime to choose a random owner password
++# for you.
++tpm_ownerpassword = "{{ agent.tpm_ownerpassword }}"
++
++# Whether to allow the agent to automatically extract a zip file in
++# the delivered payload after it has been decrypted, or not. Defaults to "True".
++# After decryption, the archive will be unzipped to a directory in /var/lib/keylime/secure.
++# Note: the limits on the size of the tmpfs partition set above with the 'secure_size'
++# option will affect this.
++extract_payload_zip = {{ agent.extract_payload_zip }}
++
++# Whether to listen for revocation notifications from the verifier via ZeroMQ
++enable_revocation_notifications = {{ agent.enable_revocation_notifications }}
++
++# The IP to listen for revocation notifications via ZeroMQ
++revocation_notification_ip = "{{ agent.revocation_notification_ip }}"
++
++# The port to listen for revocation notifications via ZeroMQ
++revocation_notification_port = {{ agent.revocation_notification_port }}
++
++# The path to the certificate to verify revocation messages received from the
++# verifier.  The path is relative to /var/lib/keylime.
++# If set to "default", Keylime will use the file RevocationNotifier-cert.crt
++# from the unzipped contents provided by the tenant.
++revocation_cert = "{{ agent.revocation_cert }}"
++
++# A comma-separated list of Python scripts to run upon receiving a revocation
++# message. Keylime will verify the signature first, then call these Python
++# scripts with the json revocation message passed as argument.  The scripts must
++# be located in the directory set via 'revocation_actions_dir'
++#
++# Keylime will also get the list of revocation actions from the file
++# action_list in the unzipped payload content.
++revocation_actions = "{{ agent.revocation_actions }}"
++
++# The path to the directory containing pre-installed revocation action scripts.
++revocation_actions_dir = "{{ agent.revocation_actions_dir }}"
++
++# A script to execute after unzipping the tenant payload.  This is like
++# cloud-init lite =)  Keylime will run it with a /bin/sh environment and
++# with a working directory of /var/lib/keylime/secure/unzipped.
++payload_script = "{{ agent.payload_script }}"
++
++# In case mTLS for the agent is disabled and the use of payloads is still
++# required, this option has to be set to "True" in order to allow the agent
++# to start. Details on why this configuration (mTLS disabled and payload enabled)
++# is generally considered insecure can be found on
++# https://github.com/keylime/keylime/security/advisories/GHSA-2m39-75g9-ff5r
++enable_insecure_payload = {{ agent.enable_insecure_payload }}
++
++# Whether to allow running revocation actions sent as part of the payload.
++# Setting to false limits revocation actions to pre-installed ones.
++allow_payload_revocation_actions = {{ agent.allow_payload_revocation_actions }}
++
++# Maximum number of retries for exponential backoff
++exponential_backoff_max_retries = {{ agent.exponential_backoff_max_retries }}
++# Initial delay in milliseconds for exponential backoff
++exponential_backoff_initial_delay = {{ agent.exponential_backoff_initial_delay }}
++# Maximum delay in milliseconds for exponential backoff
++exponential_backoff_max_delay = {{ agent.exponential_backoff_max_delay }}
++
++# List of hash algorithms used for PCRs
++# Accepted values: sha512, sha384, sha256, sha1
++tpm_hash_alg = "{{ agent.tpm_hash_alg }}"
++
++# List of encryption algorithms to use with the TPM
++# Accepted values: ecc, rsa
++tpm_encryption_alg = "{{ agent.tpm_encryption_alg }}"
++
++# List of signature algorithms to use
++# Accepted values: rsassa, rsapss, ecdsa, ecdaa, ecschnorr
++tpm_signing_alg = "{{ agent.tpm_signing_alg }}"
++
++# If an EK is already present on the TPM (e.g., with "tpm2_createek") and
++# you require Keylime to use this EK, change "generate" to the actual EK
++# handle (e.g. "0x81000000"). The Keylime agent will then not attempt to
++# create a new EK upon startup, and neither will it flush the EK upon exit.
++ek_handle = "{{ agent.ek_handle }}"
++
++# Enable IDevID and IAK usage
++enable_iak_idevid = {{ agent.enable_iak_idevid }}
++
++# Select IDevID and IAK templates or algorithms for regenerating the keys.
++# By default the template will be detected automatically from the certificates. This will happen if iak_idevid_template is left empty or set as "default" or "detect".
++# Choosing a template will override the name and asymmetric algorithm choices. To use these choices, set iak_idevid_template to "manual"
++# Templates are specified in the TCG document found here, section 7.3.4:
++# https://trustedcomputinggroup.org/wp-content/uploads/TPM-2p0-Keys-for-Device-Identity-and-Attestation_v1_r12_pub10082021.pdf
++#
++# Accepted values:
++# iak_idevid_template:        default, detect, H-1, H-2, H-3, H-4, H-5, manual
++# iak_idevid_asymmetric_alg:   rsa, ecc
++# iak_idevid_name_alg:        sha256, sm3_256, sha384, sha512
++iak_idevid_template = "{{ agent.iak_idevid_template }}"
++# In order for these values to be used, set the iak_idevid_template option to manual
++iak_idevid_asymmetric_alg = "{{ agent.iak_idevid_asymmetric_alg }}"
++iak_idevid_name_alg = "{{ agent.iak_idevid_name_alg }}"
++
++# Alternatively if the keys are persisted, provide the handles for their location below, and optionally their passwords.
++# If handles are provided, they will take priority over templates/algorithms selected above.
++# To use a hex password, use the prefix "hex:" at the start of the password.
++idevid_password = "{{ agent.idevid_password }}"
++idevid_handle = "{{ agent.idevid_handle }}"
++
++iak_password = "{{ agent.iak_password }}"
++iak_handle = "{{ agent.iak_handle }}"
++
++# The name of the file containing the X509 IAK certificate.
++# If set as "default", the "iak-cert.crt" value is used
++# If a relative path is set, it will be considered relative from the keylime_dir.
++# If an absolute path is set, it is used without change.
++#
++# To override iak_cert, set KEYLIME_AGENT_IAK_CERT environment variable.
++iak_cert = "{{ agent.iak_cert }}"
++
++# The name of the file containing the X509 IDevID certificate.
++# If set as "default", the "idevid-cert.crt" value is used
++# If a relative path is set, it will be considered relative from the keylime_dir.
++# If an absolute path is set, it is used without change.
++#
++# To override idevid_cert, set KEYLIME_AGENT_IDEVID_CERT environment variable.
++idevid_cert = "{{ agent.idevid_cert }}"
++
++# The user account to switch to to drop privileges when started as root
++# If left empty, the agent will keep running with high privileges.
++# The user and group specified here must allow the user to access the
++# WORK_DIR (typically /var/lib/keylime) and /dev/tpmrm0. Therefore,
++# suggested value for the run_as parameter is keylime:tss.
++# The following commands should be used to set ownership before running the
++# agent:
++# chown keylime /var/lib/keylime
++#
++# If tpmdata.yml already exists:
++# chown keylime /var/lib/keylime/tpmdata.yml
++#
++# If cv_ca directory exists:
++# chown keylime /var/lib/keylime/cv_ca
++# chown keylime /var/lib/keylime/cv_ca/cacert.crt
++run_as = "{{ agent.run_as }}"
++
++# Path from where the agent will read the IMA measurement log.
++#
++# If set as "default", Keylime will use the default path:
++# The default path is /sys/kernel/security/ima/ascii_runtime_measurements
++# If set as a relative path, it will be considered from the root path "/".
++# If set as an absolute path, it will use it without changes
++ima_ml_path = "{{ agent.ima_ml_path }}"
++
++# Path from where the agent will read the measured boot event log.
++#
++# If set as "default", Keylime will use the default path:
++# The default path is /sys/kernel/security/tpm0/binary_bios_measurements
++# If set as a relative path, it will be considered from the root path "/".
++# If set as an absolute path, it will use it without changes
++measuredboot_ml_path = "{{ agent.measuredboot_ml_path }}"
+diff --git a/templates/2.6/ca.j2 b/templates/2.6/ca.j2
+new file mode 100644
+index 0000000..03ebe3b
+--- /dev/null
++++ b/templates/2.6/ca.j2
+@@ -0,0 +1,39 @@
++# Keylime CA configuration
++[ca]
++
++# The keystore password
++# This password is used to protect the generated CA private key.
++password = {{ ca.password }}
++
++# The configuration file version number
++version = {{ ca.version }}
++
++# CountryName argument (C) of the Issuer when generating certificates
++cert_country = {{ ca.cert_country }}
++
++# CommonName argument (CN) of the Issuer when generating certificates
++cert_ca_name = {{ ca.cert_ca_name }}
++
++# StateOrProvinceName argument (S) of the Issuer when generating certificates
++cert_state = {{ ca.cert_state }}
++
++# Locality argument (L) of the Issuer when generating certificates
++cert_locality = {{ ca.cert_locality }}
++
++# Organization argument (O) of the Issuer when generating certificates
++cert_organization = {{ ca.cert_organization }}
++
++# OrganizationalUnit argument (OU) of the Issuer when generating certificates
++cert_org_unit = {{ ca.cert_org_unit }}
++
++# CA certificate validity time in days
++cert_ca_lifetime = {{ ca.cert_ca_lifetime }}
++
++# Default generated certificate validity time in days
++cert_lifetime = {{ ca.cert_lifetime }}
++
++# Key length in bits
++cert_bits = {{ ca.cert_bits }}
++
++# Certificate Revocation List (CRL) distribution address (URL)
++cert_crl_dist = {{ ca.cert_crl_dist }}
+diff --git a/templates/2.6/logging.j2 b/templates/2.6/logging.j2
+new file mode 100644
+index 0000000..9bd8deb
+--- /dev/null
++++ b/templates/2.6/logging.j2
+@@ -0,0 +1,33 @@
++# Keylime logging configuration
++
++# The configuration file version number
++[logging]
++version = {{ logging.version }}
++
++[loggers]
++keys = {{ loggers.get('keys') }}
++
++[handlers]
++keys = {{ handlers.get('keys') }}
++
++[formatters]
++keys = {{ formatters.get('keys') }}
++
++[formatter_formatter]
++format = {{ formatter_formatter.format }}
++datefmt = {{ formatter_formatter.datefmt }}
++
++[logger_root]
++level = {{ logger_root.level }}
++handlers = {{ logger_root.handlers }}
++
++[handler_consoleHandler]
++class = {{ handler_consoleHandler.class }}
++level = {{ handler_consoleHandler.level }}
++formatter = {{ handler_consoleHandler.formatter }}
++args = {{ handler_consoleHandler.args }}
++
++[logger_keylime]
++level = {{ logger_keylime.level }}
++qualname = {{ logger_keylime.qualname }}
++handlers = {{ logger_keylime.handlers }}
+diff --git a/templates/2.6/mapping.json b/templates/2.6/mapping.json
+new file mode 100644
+index 0000000..ce10d12
+--- /dev/null
++++ b/templates/2.6/mapping.json
+@@ -0,0 +1,11 @@
++{
++    "version": "2.6",
++    "type": "update",
++    "components": {
++        "verifier": {
++            "add": {
++                "shutdown_drain_timeout": "10"
++            }
++        }
++    }
++}
+diff --git a/templates/2.6/registrar.j2 b/templates/2.6/registrar.j2
+new file mode 100644
+index 0000000..06f026e
+--- /dev/null
++++ b/templates/2.6/registrar.j2
+@@ -0,0 +1,168 @@
++# Keylime registrar configuration
++[registrar]
++
++# The configuration file version number
++version = {{ registrar.version }}
++
++# The binding address and port for the registrar server
++ip = "{{ registrar.ip }}"
++port = {{ registrar.port }}
++tls_port = {{ registrar.tls_port }}
++
++# The 'tls_dir' option defines the directory where the keys and certificates are
++# stored.
++#
++# If set as 'generate', automatically generate a CA, keys, and certificates for
++# the registrar server in the /var/lib/keylime/reg_ca directory, if not present.
++#
++# The 'server_key', 'server_cert', and 'trusted_client_ca' options should all be
++# set with the 'default' keyword when 'generate' keyword is set for 'tls_dir'.
++#
++# If set as 'default', share the files with the verifier by using the
++# '/var/lib/keylime/cv_ca' directory, which should contain the files indicated by
++# the 'server_key', 'server_cert', and 'trusted_client_ca' options.
++tls_dir = {{ registrar.tls_dir }}
++
++# The name of the file containing the Keylime registrar server private key.
++# The file should be stored in the directory set in the 'tls_dir' option.
++# This private key is used to serve the Keylime registrar REST API
++#
++# If set as 'default', the 'server-private.pem' value is used.
++server_key = {{ registrar.server_key }}
++
++# Set the password used to decrypt the private key file.
++# If 'tls_dir = generate', this password will also be used to protect the
++# generated server private key.
++# If left empty, the private key will not be encrypted.
++server_key_password = {{ registrar.server_key_password }}
++
++# The name of the file containing the Keylime registrar server certificate.
++# The file should be stored in the directory set in the 'tls_dir' option.
++#
++# If set as 'default', the 'server-cert.crt' value is used.
++server_cert = {{ registrar.server_cert }}
++
++# Additional Subject Alternative Names (SANs) to include in auto-generated
++# server certificates when 'tls_dir = generate'.
++#
++# This is a comma-separated list of hostnames and/or IP addresses that will be
++# added to the server certificate's SAN extension. This allows clients to verify
++# the server's hostname when connecting.
++#
++# By default, the certificate will automatically include:
++# - localhost, 127.0.0.1, and ::1
++# - The system's hostname and FQDN
++# - The IP address from the 'ip' option (if not 0.0.0.0 or ::)
++#
++# Use this option to add additional names, such as:
++# - External DNS names (e.g., registrar.example.com)
++# - Load balancer addresses
++# - Additional IP addresses
++#
++# Example: cert_subject_alternative_names = registrar.example.com,10.0.0.5,registrar-internal
++# Leave empty to use only the automatically detected names.
++cert_subject_alternative_names = {{ registrar.cert_subject_alternative_names }}
++
++# The list of trusted client CA certificates.
++# The files in the list should be stored in the directory set in the 'tls_dir'
++# option.
++#
++# If set as 'default', the value is set as '[cacert.crt]'
++trusted_client_ca = {{ registrar.trusted_client_ca }}
++
++# Authorization provider to use for access control decisions.
++#
++# Available providers:
++#   simple - Default provider implementing 2-category access control:
++#            - PUBLIC: No authentication (agent registration, activation, version)
++#            - ADMIN: mTLS client certificate (listing, viewing, deleting registrations)
++#
++# The 'simple' provider enforces strict separation:
++#   - Agent registration endpoints are public (no authentication required)
++#   - Management endpoints require mTLS client certificate authentication
++#
++# SECURITY NOTE: Never distribute client certificates signed by the registrar's
++# trusted CA to agents. Agents should register via public endpoints only.
++#
++# Certificate requirements:
++#   - Agents: No client certs needed (public registration endpoints)
++#   - Admins: Client certs signed by trusted CA with Client Authentication EKU
++authorization_provider = {{ registrar.authorization_provider }}
++
++# Database URL Configuration
++# See this document https://keylime.readthedocs.io/en/latest/installation.html#database-support
++# for instructions on using different database configurations.
++#
++# An example of database_url value for using sqlite:
++#   sqlite:////var/lib/keylime/reg_data.sqlite
++# An example of database_url value for using mysql:
++#   mysql+pymysql://keylime:keylime@keylime_db:[port]/registrar?charset=utf8
++#
++# If set as 'sqlite' keyword, will use the configuration set by the file located
++# at "/var/lib/keylime/reg_data.sqlite".
++database_url = {{ registrar.database_url }}
++
++# Limits for DB connection pool size in sqlalchemy
++# (https://docs.sqlalchemy.org/en/14/core/pooling.html#api-documentation-available-pool-implementations)
++database_pool_sz_ovfl = {{ registrar.database_pool_sz_ovfl }}
++
++# Whether to automatically update the DB schema using alembic
++auto_migrate_db = {{ registrar.auto_migrate_db }}
++
++# Durable Attestation is currently marked as an experimental feature
++# In order to enable Durable Attestation, an "adapter" for a Persistent data Store
++# (time-series like database) needs to be specified. Some example adapters can be
++# found under "da/examples" so, for instance
++#      "durable_attestation_import = keylime.da.examples.redis.py"
++# could be used to interact with a Redis (Persistent data Store)
++durable_attestation_import = {{ registrar.durable_attestation_import }}
++
++# If an adapter for Durable Attestation was specified, then the URL for a Persistent Store
++# needs to be specified here. A second optional URL could be specified, for a
++# Rekor Transparency Log. A third additional URL could be specified, pointing to a
++# Time Stamp Authority (TSA), compatible with RFC3161. Additionally, one might need to
++# specify a path containing certificates required by the stores or TSA. Continuing with
++# the above example, the following values could be assigned to the parameters:
++#      "persistent_store_url=redis://127.0.0.1:6379?db=10&password=/root/redis.auth&prefix=myda"
++#      "transparency_log_url=http://127.0.0.1:3000"
++#      "time_stamp_authority_url=http://127.0.0.1:2020"
++#      "time_stamp_authority_certs_path=~/mycerts/tsa_cert1.pem"
++persistent_store_url = {{ registrar.persistent_store_url }}
++transparency_log_url = {{ registrar.transparency_log_url }}
++time_stamp_authority_url = {{ registrar.time_stamp_authority_url }}
++time_stamp_authority_certs_path = {{ registrar.time_stamp_authority_certs_path }}
++
++# If Durable Attestation was enabled, which requires a Persistent Store URL
++# to be specified, the two following parameters control the format and encoding
++# of the stored attestation artifacts (defaults "json" for format and "" for encoding)
++persistent_store_format = {{ registrar.persistent_store_format }}
++persistent_store_encoding = {{ registrar.persistent_store_encoding }}
++
++# If Durable Attestation was enabled and a Transparency Log URL was specified,
++# the digest algorithm for signatures is controlled by this parameter (default "sha256")
++transparency_log_sign_algo = {{ registrar.transparency_log_sign_algo }}
++
++# If Durable Attestation was enabled and a Transparency Log URL was specified,
++# a keylime administrator can specify some agent attributes (including attestation
++# artifacts, such as quotes and logs) to be signed by the registrar. The use of "all"
++# will result in the whole "package" (agent + artifacts) being signed and leaving it empty
++# will mean no signing should be done.
++signed_attributes = {{ registrar.signed_attributes }}
++
++# What TPM-based identity is allowed to be used to register agents.
++# The options "default" and "iak_idevid" will only allow registration with IAK and IDevID if python cryptography is version 38.0.0 or higher.
++# The following options are accepted:
++# "default": either an EK or IAK and IDevID may be used. In the case that cryptography version is <38.0.0 only EK will be used
++# "ek_cert_or_iak_idevid": this is equivalent to default
++# "ek_cert": only allow agents to use an EK to register
++# "iak_idevid": only allow agents with an IAK and IDevID to register
++tpm_identity = {{ registrar.tpm_identity }}
++
++# The below option controls what Keylime does when it encounters a certificate which is not parse-able when strict
++# ASN.1 Distinguished Encoding Rules (DER) are enforced. The default behaviour ("warn") is to log a warning but still
++# accept the certificate, so long as it can be interpreted by a fallback parser.
++# The following values are accepted:
++# "warn": log a warning and re-encode the certificate with the more-forgiving fallback parser (the default)
++# "reject": log an error and refuse to accept the certificate
++# "ignore": silently re-encode the certificate without logging a message
++malformed_cert_action = {{ registrar.malformed_cert_action }}
+\ No newline at end of file
+diff --git a/templates/2.6/tenant.j2 b/templates/2.6/tenant.j2
+new file mode 100644
+index 0000000..79934bf
+--- /dev/null
++++ b/templates/2.6/tenant.j2
+@@ -0,0 +1,130 @@
++# Keylime tenant configuration
++[tenant]
++
++# The configuration file version number
++version = {{ tenant.version }}
++
++# The verifier IP address and port
++verifier_ip = {{ tenant.verifier_ip }}
++verifier_port = {{ tenant.verifier_port }}
++
++# The registrar IP address and port
++registrar_ip = {{ tenant.registrar_ip }}
++registrar_port = {{ tenant.registrar_port }}
++
++# The 'tls_dir' option defines the directory where the keys and certificates are
++# stored.
++#
++# If set as 'default', share the files with the verifier by using the
++# '/var/lib/keylime/cv_ca', which should contain the files indicated by the
++# 'client_key', 'client_cert', and 'trusted_server_ca' options.
++tls_dir = {{ tenant.tls_dir }}
++
++# Enable mTLS communication between agent, verifier and tenant.
++# Details on why setting it to "False" is generally considered insecure can be found
++# on https://github.com/keylime/keylime/security/advisories/GHSA-2m39-75g9-ff5r
++enable_agent_mtls = {{ tenant.enable_agent_mtls }}
++
++# The name of the file containing the Keylime tenant client private key.
++# The file should be stored in the directory set in the 'tls_dir' option.
++# This private key is used by the Keylime tenant to connect to the other
++# services using TLS.
++#
++# If set as 'default', the 'client-private.pem' value is used.
++client_key = {{ tenant.client_key }}
++
++# Set the password used to encrypt the private key file.
++# If client_key is set as 'default', should match the password set in the
++# 'client_key_password' option in the verifier configuration file
++client_key_password = {{ tenant.client_key_password }}
++
++# The name of the file containing the Keylime tenant client certificate.
++# The file should be stored in the directory set in the 'tls_dir' option.
++# This certificate is used by the Keylime tenant to connect to the other
++# services using TLS.
++#
++# If set as 'default', the 'client-cert.crt' value is used.
++client_cert = {{ tenant.client_cert }}
++
++# The list of trusted server CA certificates.
++# The files in the list should be stored in the directory set in the 'tls_dir'
++# option.
++#
++# If set as 'default', the value is set as '[cacert.crt]'
++trusted_server_ca = {{ tenant.trusted_server_ca }}
++
++# Directory containing the EK CA certificates.
++# The EK certificate provided by the agent will be validated against the CAs
++# located in this directory.
++tpm_cert_store = {{ tenant.tpm_cert_store }}
++
++# Maximum size of the payload in bytes. The value should match the 'secure_size'
++# option in the agent configuration
++max_payload_size = {{ tenant.max_payload_size }}
++
++# List of hash algorithms used for PCRs
++# Accepted values: sha512, sha384, sha256, sha1
++accept_tpm_hash_algs = {{ tenant.accept_tpm_hash_algs }}
++
++# List of encryption algorithms to use with the TPM
++# Accepted values: ecc, rsa
++accept_tpm_encryption_algs = {{ tenant.accept_tpm_encryption_algs }}
++
++# List of signature algorithms to use
++# Accepted values: rsassa, rsapss, ecdsa, ecdaa, ecschnorr
++accept_tpm_signing_algs = {{ tenant.accept_tpm_signing_algs }}
++
++# Whether or not to use an exponential backoff algorithm for retries.
++exponential_backoff = {{ tenant.exponential_backoff }}
++
++# Either how long to wait between failed attempts to communicate with the TPM
++# in seconds, or the base for the exponential backoff algorithm if enabled via
++# "exponential_backoff" option.
++# Floating point values are accepted.
++retry_interval = {{ tenant.retry_interval }}
++
++# Integer number of retries to communicate with the TPM before giving up.
++max_retries = {{ tenant.max_retries }}
++
++# Request timeout in seconds.
++request_timeout = {{ tenant.request_timeout }}
++
++# Tell the tenant whether to require an EK certificate from the TPM.
++# If set to False the tenant will ignore EK certificates entirely.
++#
++# WARNING: SETTING THIS OPTION TO FALSE IS VERY DANGEROUS!!!
++#
++# If you disable this check, then you may not be talking to a real TPM.
++# All the security guarantees of Keylime rely upon the security of the EK
++# and the assumption that you are talking to a spec-compliant and honest TPM.
++
++# Some physical TPMs do not have EK certificates, so you may need to set
++# this to "False" for some deployments.  If you do set it to "False", you
++# MUST use the 'ek_check_script' option below to specify a script that will
++# check the provided EK against an allowlist for the environment that has
++# been collected in a trustworthy way.  For example, the cloud provider
++# might provide a signed list of EK public key hashes.  Then you could write
++# an ek_check_script that checks the signature of the allowlist and then
++# compares the hash of the given EK with the allowlist.
++require_ek_cert = {{ tenant.require_ek_cert }}
++
++# Optional script to execute to check the EK and/or EK certificate against a
++# allowlist or any other additional EK processing you want to do. Runs in
++# /var/lib/keylime. You can also specify an absolute path to the script.
++# Script should return 0 if the EK or EK certificate are valid.  Any other
++# return value will invalidate the tenant quote check and prevent
++# bootstrapping a key.
++#
++# The various keys are passed to the script via environment variables:
++# EK - contains a PEM encoded version of the public EK
++# EK_CERT - contains a DER encoded EK certificate if one is available.
++# PROVKEYS - contains a json document containing EK, EKcert, and AIK from the
++# provider.  EK and AIK are in PEM format.  The EKcert is in base64 encoded
++# DER format.
++#
++# Set to blank to disable this check.  See warning above if require_ek_cert
++# is "False".
++ek_check_script = {{ tenant.ek_check_script }}
++
++# Path to file containing the measured boot reference state
++mb_refstate = {{ tenant.mb_refstate }}
+diff --git a/templates/2.6/verifier.j2 b/templates/2.6/verifier.j2
+new file mode 100644
+index 0000000..43c8e54
+--- /dev/null
++++ b/templates/2.6/verifier.j2
+@@ -0,0 +1,350 @@
++# Keylime verifier configuration
++[verifier]
++
++# The configuration file version number
++version = {{ verifier.version }}
++
++# Unique identifier for each verifier instance.
++uuid = {{ verifier.uuid }}
++
++# The binding address and port for the verifier server
++ip = "{{ verifier.ip }}"
++port = {{ verifier.port }}
++
++# The address and port of registrar server that the verifier communicates with
++registrar_ip = {{ verifier.registrar_ip }}
++registrar_port = {{ verifier.registrar_port }}
++
++# Enable mTLS communication between agent, verifier and tenant.
++# Details on why setting it to "False" is generally considered insecure can be found
++# on https://github.com/keylime/keylime/security/advisories/GHSA-2m39-75g9-ff5r
++enable_agent_mtls = {{ verifier.enable_agent_mtls }}
++
++# The 'tls_dir' option defines the directory where the keys and certificates are
++# stored.
++#
++# If set as 'generate', automatically generate a CA, keys, and certificates for
++# the client and the server in the /var/lib/keylime/cv_ca directory, if not
++# present.
++#
++# The 'server_key', 'server_cert', 'client_key', 'client_cert',
++# 'trusted_client_ca', and 'trusted_server_ca' options should all be set with
++# the 'default' keyword when 'generate' keyword is set for 'tls_dir'.
++#
++# If set as 'default', the '/var/lib/keylime/cv_ca' directory is used, which
++# should contain the files indicated by  the 'server_key', 'server_cert',
++# 'client_key', 'client_cert', 'trusted_client_ca', and 'trusted_server_ca'
++# options.
++tls_dir = {{ verifier.tls_dir }}
++
++# The name of the file containing the Keylime verifier server private key.
++# The file should be stored in the directory set in the 'tls_dir' option.
++# This private key is used to serve the Keylime verifier REST API
++#
++# If set as 'default', the 'server-private.pem' value is used.
++server_key = {{ verifier.server_key }}
++
++# Set the password used to decrypt the server private key file.
++# If 'tls_dir = generate', this password will also be used to protect the
++# generated server private key.
++# If left empty, the private key will not be encrypted.
++server_key_password = {{ verifier.server_key_password }}
++
++# The name of the file containing the Keylime verifier server certificate.
++# The file should be stored in the directory set in the 'tls_dir' option.
++#
++# If set as 'default', the 'server-cert.crt' value is used.
++server_cert = {{ verifier.server_cert }}
++
++# Additional Subject Alternative Names (SANs) to include in auto-generated
++# server certificates when 'tls_dir = generate'.
++#
++# This is a comma-separated list of hostnames and/or IP addresses that will be
++# added to the server certificate's SAN extension. This allows clients to verify
++# the server's hostname when connecting.
++#
++# By default, the certificate will automatically include:
++# - localhost, 127.0.0.1, and ::1
++# - The system's hostname and FQDN
++# - The IP address from the 'ip' option (if not 0.0.0.0 or ::)
++#
++# Use this option to add additional names, such as:
++# - External DNS names (e.g., verifier.example.com)
++# - Load balancer addresses
++# - Additional IP addresses
++#
++# Example: cert_subject_alternative_names = verifier.example.com,10.0.0.5,verifier-internal
++# Leave empty to use only the automatically detected names.
++cert_subject_alternative_names = {{ verifier.cert_subject_alternative_names }}
++
++# The list of trusted client CA certificates.
++# The files in the list should be stored in the directory set in the 'tls_dir'
++# option.
++#
++# If set as 'default', the value is set as '[cacert.crt]'
++trusted_client_ca = {{ verifier.trusted_client_ca }}
++
++# The name of the file containing the Keylime verifier client private key.
++# The file should be stored in the directory set in the 'tls_dir' option.
++# This private key is used by the Keylime verifier to connect to the other
++# services using TLS.
++#
++# If set as 'default', the 'client-private.pem' value is used.
++client_key = {{ verifier.client_key }}
++
++# Set the password used to decrypt the client private key file.
++# If 'tls_dir = generate', this password will also be used to protect the
++# generated client private key.
++# If left empty, the private key will not be encrypted.
++client_key_password = {{ verifier.client_key_password }}
++
++# The name of the file containing the Keylime verifier client certificate.
++# The file should be stored in the directory set in the 'tls_dir' option.
++# This certificate is used by the Keylime verifier to connect to the other
++# services using TLS.
++#
++# If set as 'default', the 'client-cert.crt' value is used.
++client_cert = {{ verifier.client_cert }}
++
++# The list of trusted server CA certificates.
++# The files in the list should be stored in the directory set in the 'tls_dir'
++# option.
++#
++# If set as 'default', the value is set as '[cacert.crt]'
++trusted_server_ca = {{ verifier.trusted_server_ca }}
++
++# Authorization provider to use for access control decisions.
++#
++# Available providers:
++#   simple - Default provider implementing 4-category access control:
++#            - PUBLIC: No authentication (version info, evidence verification)
++#            - AGENT_ONLY: PoP bearer token + resource ownership (attestations)
++#            - AGENT_OR_ADMIN: PoP token or mTLS certificate (read own agent)
++#            - ADMIN: mTLS client certificate (all management operations)
++#
++# The 'simple' provider enforces strict separation between agent and admin
++# authentication methods:
++#   - Agents authenticate via PoP (Proof-of-Possession) bearer tokens only
++#   - Admins authenticate via mTLS client certificates only
++#   - If an Authorization header is present, mTLS is never used (prevents
++#     privilege escalation)
++#
++# SECURITY NOTE: Never distribute client certificates signed by the verifier's
++# trusted CA to agents. Agents should only have PoP tokens for authentication.
++#
++# Certificate requirements:
++#   - Pull mode agents: Self-signed server certs are acceptable. If CA-issued,
++#     must have Server Authentication EKU only.
++#   - Push mode agents: No client certs from trusted CA. Use PoP tokens only.
++#   - Admins: Client certs signed by trusted CA with Client Authentication EKU.
++authorization_provider = {{ verifier.authorization_provider }}
++
++# Database URL Configuration
++# See this document https://keylime.readthedocs.io/en/latest/installation.html#database-support
++# for instructions on using different database configurations.
++#
++# An example of database_url value for using sqlite:
++#   sqlite:////var/lib/keylime/cv_data.sqlite
++# An example of database_url value for using mysql:
++#   mysql+pymysql://keylime:keylime@keylime_db:[port]/verifier?charset=utf8
++#
++# If set as 'sqlite' keyword, will use the configuration set by the file located
++# at "/var/lib/keylime/cv_data.sqlite".
++database_url = {{ verifier.database_url }}
++
++# Limits for DB connection pool size in sqlalchemy
++# (https://docs.sqlalchemy.org/en/14/core/pooling.html#api-documentation-available-pool-implementations)
++database_pool_sz_ovfl = {{ verifier.database_pool_sz_ovfl }}
++
++# Whether to automatically update the DB schema using alembic
++auto_migrate_db = {{ verifier.auto_migrate_db }}
++
++# The number of worker processes to use for the cloud verifier.
++# Set to "0" to create one worker per processor.
++num_workers = {{ verifier.num_workers }}
++
++# Whether or not to use an exponential backoff algorithm for retries.
++exponential_backoff = {{ verifier.exponential_backoff }}
++
++# Either how long to wait between failed attempts to connect to a cloud agent
++# in seconds, or the base for the exponential backoff algorithm.
++# Floating point values accepted here.
++retry_interval = {{ verifier.retry_interval }}
++
++# Number of retries to connect to an agent before giving up. Must be an integer.
++max_retries = {{ verifier.max_retries }}
++
++# Time between integrity measurement checks, in seconds.  If set to "0", checks
++# will be done as fast as possible.  Floating point values accepted here.
++quote_interval = {{ verifier.quote_interval }}
++
++# The verifier limits the size of upload payloads (allowlists) which defaults to
++# 100MB (104857600 bytes). This setting can be raised (or lowered) based on the
++# size of the actual payloads
++max_upload_size = {{ verifier.max_upload_size }}
++
++# Timeout in seconds for HTTP requests
++request_timeout = {{ verifier.request_timeout }}
++
++# The name of the boot attestation policy to use in comparing a measured boot event log
++# with a measured boot reference state.
++# A policy is a Python object that `isinstance` of `keylime.elchecking.policies.Policy`
++# and was registered by calling `keylime.elchecking.policies.register`.
++# The keylime agent extracts the measured boot event log.
++# The verifier client specifies the measured boot reference state to use;
++# this is specified independently for each agent.
++# Depending on the policy, the same reference state may be usable with multiple agents.
++# The `accept-all` policy ignores the reference state and approves every log.
++measured_boot_policy_name = {{ verifier.measured_boot_policy_name }}
++
++# This is a list of Python modules to dynamically load, for example to register
++# additional boot attestation policies.
++# Empty strings in the list are ignored.
++# A module here may be relative, in which case it is interpreted
++# relative to the keylime.elchecking package.
++# The default value for this config item is the empty list.
++measured_boot_imports = {{ verifier.measured_boot_imports }}
++
++# This is used to manage the number of times measured boot attestation
++# is done. In other words, it controls the number of times the call
++# to the measured boot policy engine is made to evaluate the boot log
++# against the policy specified.
++# Here are its possible values and number of bootlog evaluations.
++# once (default)  : Bootlog evaluation will be done for only one time.
++# always          : Bootlog evaluation will always be done (i.e. for unlimited times).
++measured_boot_evaluate = {{ verifier.measured_boot_evaluate }}
++
++# Severity labels for revocation events strictly ordered from least severity to
++# highest severity.
++severity_labels = {{ verifier.severity_labels }}
++
++# Severity policy that matches different event_ids to the severity label.
++# The rules are evaluated from the beginning of the list and the first match is
++# used. The event_id can also be a regex. Default policy assigns the highest
++# severity to all events.
++severity_policy = {{ verifier.severity_policy }}
++
++# If files are already opened when IMA tries to measure them this causes
++# a time of measure, time of use (ToMToU) error entry.
++# By default we ignore those entries and only print a warning.
++# Set to False to treat ToMToU entries as errors.
++ignore_tomtou_errors = {{ verifier.ignore_tomtou_errors }}
++
++# Durable Attestation is currently marked as an experimental feature
++# In order to enable Durable Attestation, an "adapter" for a Persistent data Store
++# (time-series like database) needs to be specified. Some example adapters can be
++# found under "da/examples" so, for instance
++#      "durable_attestation_import = keylime.da.examples.redis.py"
++# could be used to interact with a Redis (Persistent data Store)
++durable_attestation_import = {{ verifier.durable_attestation_import }}
++
++# If an adapter for Durable Attestation was specified, then the URL for a Persistent Store
++# needs to be specified here. A second optional URL could be specified, for a
++# Rekor Transparency Log. A third additional URL could be specified, pointing to a
++# Time Stamp Authority (TSA), compatible with RFC3161. Additionally, one might need to
++# specify a path containing certificates required by the stores or TSA. Continuing with
++# the above example, the following values could be assigned to the parameters:
++#      "persistent_store_url=redis://127.0.0.1:6379?db=10&password=/root/redis.auth&prefix=myda"
++#      "transparency_log_url=http://127.0.0.1:3000"
++#      "time_stamp_authority_url=http://127.0.0.1:2020"
++#      "time_stamp_authority_certs_path=~/mycerts/tsa_cert1.pem"
++persistent_store_url = {{ verifier.persistent_store_url }}
++transparency_log_url = {{ verifier.transparency_log_url }}
++time_stamp_authority_url = {{ verifier.time_stamp_authority_url }}
++time_stamp_authority_certs_path = {{ verifier.time_stamp_authority_certs_path }}
++
++# If Durable Attestation was enabled, which requires a Persistent Store URL
++# to be specified, the two following parameters control the format and encoding
++# of the stored attestation artifacts (defaults "json" for format and "" for encoding)
++persistent_store_format = {{ verifier.persistent_store_format }}
++persistent_store_encoding = {{ verifier.persistent_store_encoding }}
++
++# If Durable Attestation was enabled and a Transparency Log URL was specified,
++# the digest algorithm for signatures is controlled by this parameter (default "sha256")
++transparency_log_sign_algo = {{ verifier.transparency_log_sign_algo }}
++
++# If Durable Attestation was enabled and a Transparency Log URL was specified,
++# a keylime administrator can specify some agent attributes (including attestation
++# artifacts, such as quotes and logs) to be signed by the verifier. The use of "all"
++# will result in the whole "package" (agent + artifacts) being signed and leaving it empty
++# will mean no signing should be done.
++signed_attributes = {{ verifier.signed_attributes }}
++
++# Require that allowlists are signed with a key passed via the tenant tool
++require_allow_list_signatures = {{ verifier.require_allow_list_signatures }}
++
++# Attestation mode. Can be 'pull' (traditional) or 'push' (agent-driven).
++# Default: pull
++mode = {{ verifier.mode }}
++#
++# Lifetime in seconds for challenges sent to agents in push mode.
++challenge_lifetime = {{ verifier.challenge_lifetime }}
++#
++# Timeout in seconds for a single evidence verification task (0 = auto).
++verification_timeout = {{ verifier.verification_timeout }}
++#
++# Rate limiting for session creation endpoint (POST /sessions) in push mode.
++# These settings prevent denial-of-service attacks where an attacker floods the verifier
++# with session creation requests. Only applies when mode = 'push'.
++#
++# Maximum number of session creation requests per IP address within the time window.
++# Allows for multiple agents from same IP (testing, NAT scenarios).
++# Default: 50
++session_create_rate_limit_per_ip = {{ verifier.session_create_rate_limit_per_ip }}
++#
++# Time window in seconds for IP-based rate limiting.
++# Default: 60
++session_create_rate_limit_window_ip = {{ verifier.session_create_rate_limit_window_ip }}
++#
++# Maximum number of session creation requests per agent_id within the time window.
++# Allows for agent retries (agent default is 3 retries, this allows ~5 auth attempts).
++# Default: 15
++session_create_rate_limit_per_agent = {{ verifier.session_create_rate_limit_per_agent }}
++#
++# Time window in seconds for agent-based rate limiting.
++# Default: 60
++session_create_rate_limit_window_agent = {{ verifier.session_create_rate_limit_window_agent }}
++#
++# Lifetime in seconds for authentication session tokens.
++# After this time, agents must re-authenticate to continue submitting attestations.
++# Default: 180 (3 minutes)
++session_lifetime = {{ verifier.session_lifetime }}
++#
++# Whether to automatically extend the session token expiry when an agent
++# submits an attestation. When enabled, active agents won't need to re-authenticate
++# as long as they continue attesting within the session_lifetime window.
++# Default: true
++extend_token_on_attestation = {{ verifier.extend_token_on_attestation }}
++
++# Maximum time in seconds to wait for in-flight attestation operations to
++# complete during shutdown. The verifier will wait up to this long for active
++# database writes and state transitions to finish before stopping the event
++# loop. Increasing this value reduces the risk of inconsistent agent state
++# after an unclean shutdown, at the cost of a slower shutdown.
++# Floating point values accepted here.
++shutdown_drain_timeout = {{ verifier.shutdown_drain_timeout }}
++
++[revocations]
++
++# List of revocation notification methods to enable.
++#
++# Available methods are:
++#
++# "agent": Deliver notification directly to the agent via the REST
++# protocol.
++#
++# "zeromq": Enable the ZeroMQ based revocation notification method;
++# zmq_ip and zmq_port options must be set. Currently this only works if you are
++# using keylime-CA.
++#
++# "webhook": Send notification via webhook. The endpoint URL must be
++# configured with 'webhook_url' option. This can be used to notify other
++# systems that do not have a Keylime agent running.
++enabled_revocation_notifications = {{ revocations.enabled_revocation_notifications }}
++
++# The binding address and port of the revocation notifier service via ZeroMQ.
++zmq_ip = {{ revocations.zmq_ip }}
++zmq_port = {{ revocations.zmq_port }}
++
++# Webhook url for revocation notifications.
++webhook_url = {{ revocations.webhook_url }}
+diff --git a/test/test_shutdown.py b/test/test_shutdown.py
+new file mode 100644
+index 0000000..85a10d3
+--- /dev/null
++++ b/test/test_shutdown.py
+@@ -0,0 +1,210 @@
++"""Unit tests for the shutdown coordination module and verifier drain logic."""
++
++# pylint: disable=protected-access,import-outside-toplevel
++
++import asyncio
++import unittest
++from unittest.mock import patch
++
++from keylime import shutdown
++
++
++class TestShutdownFlag(unittest.TestCase):
++    """Test the process-wide shutdown flag."""
++
++    def setUp(self) -> None:
++        # Reset the module-level event before each test
++        shutdown._shutdown_event = asyncio.Event()
++
++    def test_initial_state_not_shutting_down(self) -> None:
++        self.assertFalse(shutdown.is_shutting_down())
++
++    def test_request_shutdown_sets_flag(self) -> None:
++        shutdown.request_shutdown()
++        self.assertTrue(shutdown.is_shutting_down())
++
++    def test_request_shutdown_is_idempotent(self) -> None:
++        shutdown.request_shutdown()
++        shutdown.request_shutdown()
++        self.assertTrue(shutdown.is_shutting_down())
++
++
++class TestOperationTracking(unittest.TestCase):
++    """Test _enter_operation / _exit_operation and drain logic."""
++
++    def setUp(self) -> None:
++        # Import here so we can reset module globals
++        from keylime import cloud_verifier_tornado as cvt
++
++        self.cvt = cvt
++        # Save and reset module state
++        self._saved_active = cvt._active_operations
++        self._saved_event = cvt._operations_drained
++        cvt._active_operations = 0
++        cvt._operations_drained = asyncio.Event()
++        cvt._operations_drained.set()
++
++    def tearDown(self) -> None:
++        self.cvt._active_operations = self._saved_active
++        self.cvt._operations_drained = self._saved_event
++
++    def test_initial_state_is_drained(self) -> None:
++        self.assertEqual(self.cvt.get_active_operations(), 0)
++        self.assertTrue(self.cvt._operations_drained.is_set())
++
++    def test_enter_increments_and_clears_drain(self) -> None:
++        self.cvt._enter_operation()
++        self.assertEqual(self.cvt.get_active_operations(), 1)
++        self.assertFalse(self.cvt._operations_drained.is_set())
++
++    def test_exit_decrements_and_signals_drain(self) -> None:
++        self.cvt._enter_operation()
++        self.cvt._exit_operation()
++        self.assertEqual(self.cvt.get_active_operations(), 0)
++        self.assertTrue(self.cvt._operations_drained.is_set())
++
++    def test_multiple_operations_drain_on_last_exit(self) -> None:
++        self.cvt._enter_operation()
++        self.cvt._enter_operation()
++        self.assertEqual(self.cvt.get_active_operations(), 2)
++        self.assertFalse(self.cvt._operations_drained.is_set())
++
++        self.cvt._exit_operation()
++        self.assertEqual(self.cvt.get_active_operations(), 1)
++        self.assertFalse(self.cvt._operations_drained.is_set())
++
++        self.cvt._exit_operation()
++        self.assertEqual(self.cvt.get_active_operations(), 0)
++        self.assertTrue(self.cvt._operations_drained.is_set())
++
++    def test_wait_for_drain_returns_true_when_already_drained(self) -> None:
++        loop = asyncio.new_event_loop()
++        try:
++            result = loop.run_until_complete(self.cvt.wait_for_drain(1.0))
++            self.assertTrue(result)
++        finally:
++            loop.close()
++
++    def test_wait_for_drain_returns_true_after_exit(self) -> None:
++        self.cvt._enter_operation()
++
++        async def _drain_after_delay() -> bool:
++            async def _exit_soon() -> None:
++                await asyncio.sleep(0.05)
++                self.cvt._exit_operation()
++
++            asyncio.ensure_future(_exit_soon())
++            return await self.cvt.wait_for_drain(2.0)
++
++        loop = asyncio.new_event_loop()
++        try:
++            result = loop.run_until_complete(_drain_after_delay())
++            self.assertTrue(result)
++            self.assertEqual(self.cvt.get_active_operations(), 0)
++        finally:
++            loop.close()
++
++    def test_wait_for_drain_returns_false_on_timeout(self) -> None:
++        self.cvt._enter_operation()
++
++        loop = asyncio.new_event_loop()
++        try:
++            result = loop.run_until_complete(self.cvt.wait_for_drain(0.1))
++            self.assertFalse(result)
++        finally:
++            loop.close()
++
++
++class TestPendingEventRegistry(unittest.TestCase):
++    """Test _register_pending_event / _cancel_pending_event / cancel_all."""
++
++    def setUp(self) -> None:
++        from keylime import cloud_verifier_tornado as cvt
++
++        self.cvt = cvt
++        self._saved_pending = dict(cvt._pending_events)
++        cvt._pending_events.clear()
++
++    def tearDown(self) -> None:
++        self.cvt._pending_events.clear()
++        self.cvt._pending_events.update(self._saved_pending)
++
++    def _make_agent(self, agent_id: str = "test-agent-1") -> dict:
++        return {"agent_id": agent_id, "pending_event": None}
++
++    def test_register_tracks_in_both_locations(self) -> None:
++        agent = self._make_agent()
++        handle = object()
++        self.cvt._register_pending_event(agent, handle)
++
++        self.assertIs(agent["pending_event"], handle)
++        self.assertIs(self.cvt._pending_events["test-agent-1"], handle)
++
++    def test_cancel_clears_both_locations(self) -> None:
++        agent = self._make_agent()
++        handle = object()
++        self.cvt._register_pending_event(agent, handle)
++
++        with patch("tornado.ioloop.IOLoop.current"):
++            self.cvt._cancel_pending_event(agent)
++
++        self.assertIsNone(agent["pending_event"])
++        self.assertNotIn("test-agent-1", self.cvt._pending_events)
++
++    def test_cancel_noop_when_no_pending_event(self) -> None:
++        agent = self._make_agent()
++        # Should not raise
++        self.cvt._cancel_pending_event(agent)
++        self.assertIsNone(agent["pending_event"])
++
++    def test_cancel_all_clears_registry(self) -> None:
++        agents = [self._make_agent(f"agent-{i}") for i in range(3)]
++        for i, agent in enumerate(agents):
++            self.cvt._register_pending_event(agent, object())
++
++        self.assertEqual(len(self.cvt._pending_events), 3)
++
++        with patch("tornado.ioloop.IOLoop.current"):
++            self.cvt.cancel_all_pending_events()
++
++        self.assertEqual(len(self.cvt._pending_events), 0)
++
++    def test_cancel_all_noop_when_empty(self) -> None:
++        # Should not raise
++        self.cvt.cancel_all_pending_events()
++
++
++class TestPushAgentMonitorCancelAll(unittest.TestCase):
++    """Test cancel_all_timeouts in push_agent_monitor."""
++
++    def setUp(self) -> None:
++        from keylime import push_agent_monitor
++
++        self.pam = push_agent_monitor
++        with self.pam._agent_timeout_handles_lock:
++            self._saved = dict(self.pam._agent_timeout_handles)
++            self.pam._agent_timeout_handles.clear()
++
++    def tearDown(self) -> None:
++        with self.pam._agent_timeout_handles_lock:
++            self.pam._agent_timeout_handles.clear()
++            self.pam._agent_timeout_handles.update(self._saved)
++
++    def test_cancel_all_clears_handles(self) -> None:
++        with self.pam._agent_timeout_handles_lock:
++            self.pam._agent_timeout_handles["a1"] = object()
++            self.pam._agent_timeout_handles["a2"] = object()
++
++        with patch("tornado.ioloop.IOLoop.current"):
++            self.pam.cancel_all_timeouts()
++
++        with self.pam._agent_timeout_handles_lock:
++            self.assertEqual(len(self.pam._agent_timeout_handles), 0)
++
++    def test_cancel_all_noop_when_empty(self) -> None:
++        # Should not raise
++        self.pam.cancel_all_timeouts()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/test_verifier_server.py b/test/test_verifier_server.py
+index da0feae..e9a47ef 100644
+--- a/test/test_verifier_server.py
++++ b/test/test_verifier_server.py
+@@ -256,51 +256,39 @@ class TestVerifierServerEngineDisposal(unittest.TestCase):
+             "_prepare_agents_on_startup should document why engine disposal is needed",
+         )
+ 
+-    def test_start_multi_resets_verifier_config_after_fork(self):
+-        """Verify start_multi() resets verifier config in each worker after forking."""
++    def test_post_fork_resets_verifier_config(self):
++        """Verify _post_fork() resets verifier config to clear inherited database state."""
+         # Read the source code
+         server_path = os.path.join(os.path.dirname(__file__), "..", "keylime", "web", "verifier_server.py")
+ 
+         with open(server_path, encoding="utf-8") as f:
+             source = f.read()
+ 
+-        # Find the start_multi method
+-        pattern = r"def start_multi\(self\).*?(?=\n    def |\Z)"
++        # Find the _post_fork method
++        pattern = r"def _post_fork\(self.*?\).*?(?=\n    def |\Z)"
+         match = re.search(pattern, source, re.DOTALL)
+ 
+-        self.assertIsNotNone(match, "start_multi method not found")
++        self.assertIsNotNone(match, "_post_fork method not found")
+         assert match is not None
+ 
+         method_body = match.group(0)
+ 
+-        # Should fork processes
+-        self.assertIn(
+-            "fork_processes",
+-            method_body,
+-            "start_multi should call tornado.process.fork_processes",
+-        )
+-
+-        # After fork, should reset verifier config (which handles engine disposal)
+-        # Look for the pattern after fork_processes()
+-        fork_index = method_body.find("fork_processes")
+-        after_fork = method_body[fork_index:]
+-
+         self.assertIn(
+             "reset_verifier_config()",
+-            after_fork,
+-            "start_multi must call reset_verifier_config() after forking to clear inherited database state",
++            method_body,
++            "_post_fork must call reset_verifier_config() to clear inherited database state",
+         )
+ 
+         self.assertIn(
+             "cloud_verifier_tornado.reset_verifier_config()",
+-            after_fork,
+-            "start_multi should call cloud_verifier_tornado.reset_verifier_config() after forking",
++            method_body,
++            "_post_fork should call cloud_verifier_tornado.reset_verifier_config()",
+         )
+ 
+-    def test_verifier_config_reset_happens_before_worker_operations(self):
+-        """Verify verifier config reset occurs after fork but before any worker operations."""
+-        # Read the source code
+-        server_path = os.path.join(os.path.dirname(__file__), "..", "keylime", "web", "verifier_server.py")
++    def test_base_server_calls_post_fork_before_start_single(self):
++        """Verify base Server.start_multi() calls _post_fork() after fork and before start_single()."""
++        # Read the base server source code
++        server_path = os.path.join(os.path.dirname(__file__), "..", "keylime", "web", "base", "server.py")
+ 
+         with open(server_path, encoding="utf-8") as f:
+             source = f.read()
+@@ -314,53 +302,49 @@ class TestVerifierServerEngineDisposal(unittest.TestCase):
+ 
+         # Extract the order of operations
+         fork_index = method_body.find("fork_processes")
+-        reset_index = method_body.find("reset_verifier_config()")
+-        start_single_index = method_body.find("self.start_single()")
++        post_fork_index = method_body.find("_post_fork")
++        start_single_index = method_body.find("start_single()")
+ 
+         # All should be present
+         self.assertNotEqual(fork_index, -1, "fork_processes call not found")
+-        self.assertNotEqual(reset_index, -1, "reset_verifier_config() call not found")
++        self.assertNotEqual(post_fork_index, -1, "_post_fork() call not found")
+         self.assertNotEqual(start_single_index, -1, "start_single() call not found")
+ 
+-        # Correct order: fork -> reset_verifier_config -> start_single
++        # Correct order: fork -> _post_fork -> start_single
+         self.assertLess(
+             fork_index,
+-            reset_index,
+-            "Verifier config reset must happen AFTER forking",
++            post_fork_index,
++            "_post_fork must be called AFTER forking",
+         )
+         self.assertLess(
+-            reset_index,
++            post_fork_index,
+             start_single_index,
+-            "Verifier config reset must happen BEFORE starting worker server",
++            "_post_fork must be called BEFORE starting worker server",
+         )
+ 
+-    def test_reset_pattern_is_documented(self):
+-        """Verify reset_verifier_config() pattern is documented."""
++    def test_post_fork_is_documented(self):
++        """Verify _post_fork() documents why reset_verifier_config() is needed."""
+         # Read the source code
+         server_path = os.path.join(os.path.dirname(__file__), "..", "keylime", "web", "verifier_server.py")
+ 
+         with open(server_path, encoding="utf-8") as f:
+             source = f.read()
+ 
+-        # Find the start_multi method
+-        pattern = r"def start_multi\(self\).*?(?=\n    def |\Z)"
++        # Find the _post_fork method
++        pattern = r"def _post_fork\(self.*?\).*?(?=\n    def |\Z)"
+         match = re.search(pattern, source, re.DOTALL)
+ 
+         assert match is not None
+         method_body = match.group(0)
+ 
+-        # Should document why reset is needed after fork
+-        fork_index = method_body.find("fork_processes")
+-        after_fork = method_body[fork_index:]
+-
+         # Should mention critical concepts: reset, inherited state, parent process
+         critical_terms = ["reset", "inherit", "parent", "database"]
+-        found_terms = [term for term in critical_terms if term.lower() in after_fork.lower()]
++        found_terms = [term for term in critical_terms if term.lower() in method_body.lower()]
+ 
+         self.assertGreaterEqual(
+             len(found_terms),
+             3,
+-            f"start_multi should document why reset_verifier_config() is needed after fork. "
++            f"_post_fork should document why reset_verifier_config() is needed after fork. "
+             f"Expected mentions of reset/inherit/parent/database, found: {found_terms}",
+         )
+ 
+@@ -398,9 +382,9 @@ class TestEngineDisposalDocumentation(unittest.TestCase):
+             f"Expected mentions of fork/connection/dispose/parent/child, found: {found_terms}",
+         )
+ 
+-    def test_start_multi_documents_disposal_reason(self):
+-        """Verify start_multi() documents why global engine disposal is needed."""
+-        server_path = os.path.join(os.path.dirname(__file__), "..", "keylime", "web", "verifier_server.py")
++    def test_base_start_multi_documents_disposal_reason(self):
++        """Verify base Server.start_multi() documents why engine disposal after fork is needed."""
++        server_path = os.path.join(os.path.dirname(__file__), "..", "keylime", "web", "base", "server.py")
+ 
+         with open(server_path, encoding="utf-8") as f:
+             source = f.read()
+@@ -416,15 +400,15 @@ class TestEngineDisposalDocumentation(unittest.TestCase):
+         fork_index = method_body.find("fork_processes")
+         after_fork = method_body[fork_index:]
+ 
+-        critical_terms = ["inherit", "corrupt", "dispose", "worker", "parent"]
++        critical_terms = ["inherit", "connection", "dispose", "worker", "parent"]
+ 
+         found_terms = [term for term in critical_terms if term.lower() in after_fork.lower()]
+ 
+         self.assertGreaterEqual(
+             len(found_terms),
+             2,
+-            f"start_multi should document why global engine disposal after fork is critical. "
+-            f"Expected mentions of inherit/corrupt/dispose/worker/parent, found: {found_terms}",
++            f"start_multi should document why engine disposal after fork is critical. "
++            f"Expected mentions of inherit/connection/dispose/worker/parent, found: {found_terms}",
+         )
+ 
+ 
+-- 
+2.53.0
+

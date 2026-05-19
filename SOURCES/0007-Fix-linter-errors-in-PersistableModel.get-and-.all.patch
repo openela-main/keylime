@@ -1,0 +1,160 @@
+From e75921f02393277e8bc5ba3d058131376516a099 Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Thu, 5 Mar 2026 17:27:41 +0100
+Subject: [PATCH] Fix linter errors in PersistableModel.get() and .all()
+
+PersistableModel.get() and .all() returned Optional[PersistableModel]
+and Sequence[PersistableModel] respectively, which caused pyright errors
+when subclasses like IMAPolicy or MBPolicy called cls.get() and expected
+the return type to match their own class.
+
+Use a TypeVar bound to PersistableModel so cls.get() on a subclass
+correctly returns Optional[SubclassType].
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/models/base/persistable_model.py       |  8 +++++---
+ keylime/web/registrar/agents_controller.py     |  6 +++---
+ keylime/web/verifier/attestation_controller.py | 17 ++++++++---------
+ 3 files changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/keylime/models/base/persistable_model.py b/keylime/models/base/persistable_model.py
+index 3380eb6..4aa596e 100644
+--- a/keylime/models/base/persistable_model.py
++++ b/keylime/models/base/persistable_model.py
+@@ -1,4 +1,4 @@
+-from typing import Any, Optional, Sequence
++from typing import Any, Optional, Sequence, TypeVar
+ 
+ from sqlalchemy import asc, desc, or_
+ from sqlalchemy.sql.expression import ClauseElement
+@@ -18,6 +18,8 @@ from keylime.models.base.persistable_model_meta import PersistableModelMeta
+ from keylime.models.base.types.dictionary import Dictionary
+ from keylime.models.base.types.list import List
+ 
++_PM = TypeVar("_PM", bound="PersistableModel")
++
+ 
+ class PersistableModel(BasicModel, metaclass=PersistableModelMeta):
+     """PersistableModel extends the BasicModel class to provide additional functionality for saving and retrieving
+@@ -181,7 +183,7 @@ class PersistableModel(BasicModel, metaclass=PersistableModelMeta):
+         return session.query(subject).filter(*filter_criteria).order_by(*sort_criteria)
+ 
+     @classmethod
+-    def get(cls, *args: Any, **kwargs: Any) -> Optional["PersistableModel"]:
++    def get(cls: type[_PM], *args: Any, **kwargs: Any) -> Optional[_PM]:
+         # pylint: disable=no-else-return
+ 
+         if cls.schema_awaiting_processing:
+@@ -203,7 +205,7 @@ class PersistableModel(BasicModel, metaclass=PersistableModelMeta):
+             return None
+ 
+     @classmethod
+-    def all(cls, *args: Any, **kwargs: Any) -> Sequence["PersistableModel"]:
++    def all(cls: type[_PM], *args: Any, **kwargs: Any) -> Sequence[_PM]:
+         if cls.schema_awaiting_processing:
+             cls.process_schema()
+ 
+diff --git a/keylime/web/registrar/agents_controller.py b/keylime/web/registrar/agents_controller.py
+index 290317f..c918f95 100644
+--- a/keylime/web/registrar/agents_controller.py
++++ b/keylime/web/registrar/agents_controller.py
+@@ -27,7 +27,7 @@ class AgentsController(Controller):
+             self.respond(404, f"Agent with ID '{agent_id}' has not been activated")
+             return
+ 
+-        self.respond(200, "Success", agent.render())
++        self.respond(200, "Success", agent.render())  # type: ignore[no-untyped-call]
+ 
+     # POST /v2[.:minor]/agents/[:agent_id]
+     def create(self, agent_id, **params):
+@@ -143,10 +143,10 @@ class AgentsController(Controller):
+             self.respond(404, f"Agent with ID '{agent_id}' not found")
+             return
+ 
+-        accepted = agent.verify_ak_response(auth_tag)  # type: ignore[attr-defined]
++        accepted = agent.verify_ak_response(auth_tag)  # type: ignore[attr-defined,no-untyped-call]
+ 
+         if accepted:
+-            agent.commit_changes()
++            agent.commit_changes()  # type: ignore[no-untyped-call]
+             self.respond(200, "Success")
+         else:
+             agent.delete()
+diff --git a/keylime/web/verifier/attestation_controller.py b/keylime/web/verifier/attestation_controller.py
+index 0e50b8a..59f280c 100755
+--- a/keylime/web/verifier/attestation_controller.py
++++ b/keylime/web/verifier/attestation_controller.py
+@@ -1,6 +1,5 @@
+ # pyright: reportAttributeAccessIssue=false
+ # Uses ORM models with dynamically-created attributes from metaclasses
+-from typing import cast
+ 
+ from keylime import agent_util, config, keylime_logging
+ from keylime.common import retry
+@@ -158,12 +157,12 @@ class AttestationController(Controller):
+ 
+     # GET /v3[.:minor]/agents/:agent_id/attestations
+     def index(self, agent_id, **_params):  # type: ignore[no-untyped-def]
+-        agent = cast(VerifierAgent | None, VerifierAgent.get(agent_id))
++        agent = VerifierAgent.get(agent_id)
+ 
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+ 
+-        results = cast(list[Attestation], Attestation.all(agent_id=agent_id))
++        results = Attestation.all(agent_id=agent_id)
+ 
+         resources = [
+             APIResource("attestation", attestation.render_state()).include(  # type: ignore[no-untyped-call]
+@@ -184,8 +183,8 @@ class AttestationController(Controller):
+ 
+     # GET /v3[.:minor]/agents/:agent_id/attestations/:index
+     def show(self, agent_id, index, **_params):  # type: ignore[no-untyped-def]
+-        agent = cast(VerifierAgent | None, VerifierAgent.get(agent_id))
+-        attestation = cast(Attestation | None, Attestation.get(agent_id=agent_id, index=index))
++        agent = VerifierAgent.get(agent_id)
++        attestation = Attestation.get(agent_id=agent_id, index=index)
+ 
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+@@ -201,7 +200,7 @@ class AttestationController(Controller):
+ 
+     # GET /v3[.:minor]/agents/:agent_id/attestations/latest
+     def show_latest(self, agent_id, **_params):  # type: ignore[no-untyped-def]
+-        agent = cast(VerifierAgent | None, VerifierAgent.get(agent_id))
++        agent = VerifierAgent.get(agent_id)
+ 
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+@@ -214,7 +213,7 @@ class AttestationController(Controller):
+     # POST /v3[.:minor]/agents/:agent_id/attestations
+     @Controller.require_json_api
+     def create(self, agent_id, attestation, **params):  # type: ignore[no-untyped-def]  # pylint: disable=unused-argument
+-        agent = cast(VerifierAgent | None, VerifierAgent.get(agent_id))
++        agent = VerifierAgent.get(agent_id)
+ 
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+@@ -310,7 +309,7 @@ class AttestationController(Controller):
+         # Extract attestation from params - it should be provided by the API request
+         attestation = params.get("attestation")
+ 
+-        agent = cast(VerifierAgent | None, VerifierAgent.get(agent_id))
++        agent = VerifierAgent.get(agent_id)
+ 
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+@@ -368,7 +367,7 @@ class AttestationController(Controller):
+     # PATCH /v3[.:minor]/agents/:agent_id/attestations/latest
+     @Controller.require_json_api
+     def update_latest(self, agent_id, **params):  # type: ignore[no-untyped-def]
+-        agent = cast(VerifierAgent | None, VerifierAgent.get(agent_id))
++        agent = VerifierAgent.get(agent_id)
+ 
+         if not agent:
+             APIError("not_found", f"No enrolled agent with ID '{agent_id}'.").send_via(self)
+-- 
+2.53.0
+

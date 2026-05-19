@@ -4,7 +4,7 @@
 ## END: Set by rpmautospec
 
 %global srcname keylime
-%global policy_version 42.1.2
+%global policy_version 43.2.1
 
 # Package is actually noarch, but it has an optional dependency that is
 # arch-specific.
@@ -13,8 +13,8 @@
 %global selinuxtype targeted
 
 Name:    keylime
-Version: 7.12.1
-Release: 11%{?dist}.4
+Version: 7.14.1
+Release: 5%{?dist}
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -24,44 +24,40 @@ Source1:        https://github.com/RedHat-SP-Security/%{name}-selinux/archive/v%
 Source2:        %{srcname}.sysusers
 Source3:        %{srcname}.tmpfiles
 
-# Backported from https://github.com/keylime/keylime/pull/1782
-# Fixes DB connections leaks (https://issues.redhat.com/browse/RHEL-102995)
-Patch:         keylime-fix-db-connection-leaks.patch
+Patch: 0001-Fix-timestamp-conversion-to-use-UTC-timezone.patch
+Patch: 0002-Fix-efivar-availability-check-in-test_create_mb_poli.patch
+Patch: 0003-Close-DB-sessions-to-prevent-connection-exhaustion.patch
+Patch: 0004-Include-thread-safe-session-management.patch
+Patch: 0005-Address-some-improvements-from-code-review.patch
+Patch: 0006-Fix-race-condition-on-in-SessionManager.patch
+Patch: 0007-Fix-linter-errors-in-PersistableModel.get-and-.all.patch
+Patch: 0008-refactor-Remove-dead-code-AuthSession.authenticate_a.patch
+Patch: 0009-db-Clean-up-scoped-session-after-each-request.patch
+Patch: 0010-fix-Check-active-flag-in-_extract_identity-and-guard.patch
+Patch: 0011-fix-Add-fork-safety-to-DBManager-via-dispose.patch
 
-# Backported from https://github.com/keylime/keylime/pull/1791
-Patch: 0002-mb-support-EV_EFI_HANDOFF_TABLES-events-on-PCR1.patch
-Patch: 0003-mb-support-vendor_db-as-logged-by-newer-shim-version.patch
+# RHEL-154776 - memleaks in verifier push-mode.
+# Backport https://github.com/keylime/keylime/pull/1866
+Patch: 0012-fix-mem-leak-remove-unbounded-functools.cache-from-l.patch
 
-# Backported from https://github.com/keylime/keylime/pull/1784
-# and https://github.com/keylime/keylime/pull/1785
-Patch: 0004-verifier-Gracefully-shutdown-on-signal.patch
-Patch: 0005-revocations-Try-to-send-notifications-on-shutdown.patch
-Patch: 0006-requests_client-close-the-session-at-the-end-of-the-.patch
+# RHEL-167448 - fix verifier race condition on agent delete.
+# Backport https://github.com/keylime/keylime/pulls/1874
+Patch: 0013-fix-verifier-race-condition-on-agent-delete.patch
 
-# Backported from https://github.com/keylime/keylime/pull/1736,
-# https://github.com/keylime/keylime/commit/11c6b7f and
-# https://github.com/keylime/keylime/commit/dd63459
-Patch: 0007-tests-change-test_mba_parsing-to-not-need-keylime-in.patch
-Patch: 0008-tests-skip-measured-boot-related-tests-for-s390x-and.patch
-Patch: 0009-tests-fix-rpm-repo-tests-from-create-runtime-policy.patch
-
-# Backported from https://github.com/keylime/keylime/pull/1793
-Patch: 0010-mba-normalize-vendor_db-in-EV_EFI_VARIABLE_AUTHORITY.patch
-
-# Backported from https://github.com/keylime/keylime/pull/1794
-Patch: 0011-fix-malformed-certs-workaround.patch
-# Backported from https://github.com/keylime/keylime/pull/1795
-Patch: 0012-keylime-policy-avoid-opening-dev-stdout.patch
-
-# CVE-2025-13609
-# Backports from:
-# - https://github.com/keylime/keylime/pull/1817/commits/1024e19d
-# - https://github.com/keylime/keylime/pull/1825
-Patch: 0013-Add-shared-memory-infrastructure-for-multiprocess-co.patch
-Patch: 0014-Fix-registrar-duplicate-UUID-vulnerability.patch
-
-# CVE-2026-1709
-Patch: 0015-CVE-2026-1709.patch
+# RHEL-167447 - verifier graceful shutdown.
+# Backport:
+# - https://github.com/keylime/keylime/pull/1809
+# - https://github.com/keylime/keylime/pull/1868
+# - https://github.com/keylime/keylime/pull/1855
+# - https://github.com/keylime/keylime/pull/1869
+# - https://github.com/keylime/keylime/pull/1883
+# - https://github.com/keylime/keylime/pull/1886
+Patch: 0014-push-attestation-documentation.patch
+Patch: 0015-remove-enable-authentication-config-option.patch
+Patch: 0016-docs-push-attestation-config-tables.patch
+Patch: 0017-verifier-graceful-shutdown.patch
+Patch: 0018-ignore-sigterm-sigint-manager-parent-processes.patch
+Patch: 0019-move-socket-var-run.patch
 
 # Main program: Apache-2.0
 # Icons: MIT
@@ -74,13 +70,16 @@ BuildRequires: python3-devel
 BuildRequires: python3-dbus
 BuildRequires: python3-jinja2
 BuildRequires: python3-cryptography
+BuildRequires: python3-docutils
 BuildRequires: python3-gpg
 BuildRequires: python3-pyasn1
 BuildRequires: python3-pyasn1-modules
+BuildRequires: python3-requests
 BuildRequires: python3-tornado
 BuildRequires: python3-sqlalchemy
 BuildRequires: python3-lark
 BuildRequires: python3-psutil
+BuildRequires: python3-pytest
 BuildRequires: python3-pyyaml
 BuildRequires: python3-jsonschema
 BuildRequires: python3-setuptools
@@ -256,6 +255,12 @@ bzip2 -9 %{srcname}.pp
 %build
 %py3_build
 
+mkdir -p manpages
+rst2man --syntax-highlight=none docs/man/keylime_tenant.1.rst manpages/keylime_tenant.1
+rst2man --syntax-highlight=none docs/man/keylime-policy.1.rst manpages/keylime-policy.1
+rst2man --syntax-highlight=none docs/man/keylime_registrar.8.rst manpages/keylime_registrar.8
+rst2man --syntax-highlight=none docs/man/keylime_verifier.8.rst manpages/keylime_verifier.8
+
 %install
 %py3_install
 mkdir -p %{buildroot}/%{_sharedstatedir}/%{srcname}
@@ -277,8 +282,10 @@ done
 
 # Ship the ek-openssl-verify script.
 mkdir -p %{buildroot}/%{_datadir}/%{srcname}/scripts
-install -Dpm 755 scripts/ek-openssl-verify \
-        %{buildroot}/%{_datadir}/%{srcname}/scripts/ek-openssl-verify
+for s in ek-openssl-verify keylime_oneshot_attestation; do
+    install -Dpm 755 scripts/"${s}" \
+            %{buildroot}/%{_datadir}/%{srcname}/scripts/"${s}"
+done
 
 # Ship configuration templates.
 cp -r ./templates %{buildroot}%{_datadir}/%{srcname}/templates/
@@ -308,6 +315,14 @@ done
 install -p -D -m 0644 %{SOURCE2} %{buildroot}/%{_sysusersdir}/%{srcname}.conf
 install -p -D -m 0644 %{SOURCE3} %{buildroot}/%{_tmpfilesdir}/%{name}.conf
 
+# Install manpages
+install -d %{buildroot}%{_mandir}/man1
+install -d %{buildroot}%{_mandir}/man8
+install -m 644 manpages/keylime_tenant.1 %{buildroot}%{_mandir}/man1/
+install -m 644 manpages/keylime-policy.1 %{buildroot}%{_mandir}/man1/
+install -m 644 manpages/keylime_registrar.8 %{buildroot}%{_mandir}/man8/
+install -m 644 manpages/keylime_verifier.8 %{buildroot}%{_mandir}/man8/
+
 %check
 # Create the default configuration files to be used by the tests.
 # Also set the associated environment variables so that the tests
@@ -322,7 +337,7 @@ export KEYLIME_CA_CONFIG="${CONF_TEMP_DIR}/ca.conf"
 export KEYLIME_LOGGING_CONFIG="${CONF_TEMP_DIR}/logging.conf"
 
 # Run the tests.
-%{python3} -m unittest
+%pytest
 
 # Cleanup.
 [ "${CONF_TEMP_DIR}" ] && rm -rf "${CONF_TEMP_DIR}"
@@ -423,6 +438,7 @@ fi
 %{_bindir}/%{srcname}_verifier
 %{_bindir}/%{srcname}_ca
 %{_unitdir}/keylime_verifier.service
+%{_mandir}/man8/keylime_verifier.8*
 
 %files registrar
 %license LICENSE
@@ -430,6 +446,7 @@ fi
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/registrar.conf
 %{_bindir}/%{srcname}_registrar
 %{_unitdir}/keylime_registrar.service
+%{_mandir}/man8/keylime_registrar.8*
 
 %if 0%{?with_selinux}
 %files selinux
@@ -443,6 +460,7 @@ fi
 %attr(500,%{srcname},%{srcname}) %dir %{_sysconfdir}/%{srcname}/tenant.conf.d
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/tenant.conf
 %{_bindir}/%{srcname}_tenant
+%{_mandir}/man1/keylime_tenant.1*
 
 %files -n python3-%{srcname}
 %license LICENSE
@@ -450,6 +468,7 @@ fi
 %{python3_sitelib}/%{srcname}
 %{_bindir}/keylime_attest
 %{_bindir}/keylime-policy
+%{_mandir}/man1/keylime-policy.1*
 
 
 %files tools
@@ -465,13 +484,14 @@ fi
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/logging.conf
 %attr(700,%{srcname},%{srcname}) %dir %{_rundir}/%{srcname}
 %attr(700,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}
-%attr(500,%{srcname},%{srcname}) %dir %{_datadir}/%{srcname}/tpm_cert_store
-%attr(400,%{srcname},%{srcname}) %{_datadir}/%{srcname}/tpm_cert_store/*.pem
+%attr(755,root,root) %dir %{_datadir}/%{srcname}/tpm_cert_store
+%attr(644,root,root) %{_datadir}/%{srcname}/tpm_cert_store/*.pem
 %attr(500,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}/tpm_cert_store
 %attr(400,%{srcname},%{srcname}) %{_sharedstatedir}/%{srcname}/tpm_cert_store/*.pem
 %{_tmpfilesdir}/%{srcname}.conf
 %{_sysusersdir}/%{srcname}.conf
 %{_datadir}/%{srcname}/scripts/ek-openssl-verify
+%{_datadir}/%{srcname}/scripts/keylime_oneshot_attestation
 %{_datadir}/%{srcname}/templates
 %{_bindir}/keylime_upgrade_config
 
@@ -480,11 +500,31 @@ fi
 
 %changelog
 ## START: Generated by rpmautospec
-* Tue Feb 03 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-16
-- CVE-2026-1709: Registrar authentication bypass
+* Fri Apr 17 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.14.1-5
+- Implement verifier graceful shutdown
 
-* Thu Dec 11 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-15
-- Registrar allows identity takeover via duplicate UUID registration
+* Thu Apr 16 2026 Sergio Arroutbi <sarroutb@redhat.com> - 7.14.1-4
+- Fix verifier race condition on agent delete
+
+* Wed Apr 01 2026 Sergio Correia <scorreia@redhat.com> - 7.14.1-3
+- Remove unbounded functools.cache from latest_attestation
+
+* Tue Mar 31 2026 Sergio Arroutbi <sarroutb@redhat.com> - 7.14.1-2
+- Add patches to fix DB connection leaks
+
+* Fri Feb 13 2026 Sergio Correia <scorreia@redhat.com> - 7.14.1-1
+- Updating for Keylime release v7.14.1
+
+* Mon Feb 02 2026 Sergio Correia <scorreia@redhat.com> - 7.12.1-17
+- Change ownership of /usr/share/keylime/tpm_cert_store to root
+
+* Wed Oct 15 2025 Marek Safarik <msafarik@redhat.com> - 7.12.1-16
+- Added manpages for keylime services and the tenant
+- Added support for ECC attestation
+- Fixed man page RST formatting for rst2man compatibility
+
+* Mon Oct 06 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-15
+- Add support for ECC attestation
 
 * Mon Sep 15 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-14
 - Properly fix malformed TPM certificates workaround

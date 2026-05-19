@@ -1,0 +1,348 @@
+From a50c7e50171d8f5999bdd927b6306f6d14974c57 Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Thu, 16 Apr 2026 14:14:06 +0200
+Subject: [PATCH 1/2] shared_data: Move SyncManager socket to /var/run/keylime/
+
+The SyncManager's server process creates a Unix domain socket for IPC
+with worker processes.  By default, this socket was placed in /tmp with
+a random name (listener-*).
+
+Move the socket to /var/run/keylime/, following standard daemon
+practice.  Keylime already uses this directory for its ZeroMQ revocation
+notification socket.
+
+Changes:
+- Pass explicit address to SyncManager so the socket is created at
+  /var/run/keylime/shared_data.<pid>.sock instead of /tmp/listener-*
+- Add _ensure_runtime_dir() to create or validate the directory
+- Add test conftest.py to redirect sockets to a temp directory
+- Add pytest to test-requirements.txt for pylint to resolve imports
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/shared_data.py | 54 +++++++++++++++++++++++++++++++++++++-----
+ test-requirements.txt  |  1 +
+ test/conftest.py       | 30 +++++++++++++++++++++++
+ 3 files changed, 79 insertions(+), 6 deletions(-)
+ create mode 100644 test/conftest.py
+
+diff --git a/keylime/shared_data.py b/keylime/shared_data.py
+index 494f2f53b..aef39bcc4 100644
+--- a/keylime/shared_data.py
++++ b/keylime/shared_data.py
+@@ -18,6 +18,23 @@
+ 
+ logger = keylime_logging.init_logging("shared_data")
+ 
++_RUNTIME_DIR = "/var/run/keylime"
++
++
++def _ensure_runtime_dir() -> None:
++    """Ensure the runtime directory exists with correct permissions.
++
++    Under systemd, ``tmpfiles.d`` creates ``/var/run/keylime/`` at boot.
++    This function provides a fallback for non-systemd execution and
++    validates permissions in either case.
++    """
++    os.makedirs(_RUNTIME_DIR, mode=0o700, exist_ok=True)
++    perms = os.stat(_RUNTIME_DIR).st_mode & 0o777
++    if perms != 0o700 or not os.access(_RUNTIME_DIR, os.W_OK | os.X_OK):
++        msg = f"{_RUNTIME_DIR} is not usable by the current process"
++        logger.error(msg)
++        raise PermissionError(msg)
++
+ 
+ def _manager_ignore_signals() -> None:
+     """Ignore SIGTERM and SIGINT in the Manager's server process.
+@@ -137,8 +154,20 @@ def __init__(self) -> None:
+         """
+         logger.debug("Initializing SharedDataManager")
+ 
+-        # Use explicit context to ensure fork compatibility
+-        # The Manager must be started BEFORE any fork() calls
++        # Ensure /var/run/keylime/ exists with correct permissions
++        # before forking the Manager server process.
++        _ensure_runtime_dir()
++        self._socket_path = os.path.join(_RUNTIME_DIR, f"shared_data.{os.getpid()}.sock")
++
++        # Remove stale socket from a previous run (e.g. after a crash).
++        # CPython's SocketListener does not pre-unlink before bind().
++        try:
++            os.unlink(self._socket_path)
++        except (FileNotFoundError, PermissionError):
++            pass
++
++        # Use explicit context to ensure fork compatibility.
++        # The Manager must be started BEFORE any fork() calls.
+         ctx = mp.get_context("fork")
+         # Use SyncManager directly (instead of the ctx.Manager() shortcut)
+         # so we can pass an initializer that makes the Manager's server
+@@ -150,7 +179,7 @@ def __init__(self) -> None:
+         # SIGKILL escalation.
+         # Cannot use 'with' context manager here: the Manager must outlive
+         # __init__ and persist for the lifetime of SharedDataManager.
+-        self._manager = SyncManager(ctx=ctx)
++        self._manager = SyncManager(address=self._socket_path, ctx=ctx)
+         self._manager.start(  # pylint: disable=consider-using-with
+             initializer=_manager_ignore_signals,
+         )
+@@ -162,8 +191,6 @@ def __init__(self) -> None:
+         self._lock = self._manager.Lock()
+         self._initialized_at = time.time()
+ 
+-        # Register handler to reinitialize manager connection after fork
+-        # This is needed because Manager uses network connections that don't survive fork
+         try:
+             self._parent_pid = os.getpid()
+             logger.debug("SharedDataManager initialized in process %d", self._parent_pid)
+@@ -173,7 +200,10 @@ def __init__(self) -> None:
+         # Ensure cleanup on exit
+         atexit.register(self.cleanup)
+ 
+-        logger.info("SharedDataManager initialized successfully")
++        logger.info(
++            "SharedDataManager initialized successfully (socket: %s)",
++            self._socket_path,
++        )
+ 
+     def set_data(self, key: str, value: Any) -> None:
+         """Store arbitrary pickleable data by key.
+@@ -333,6 +363,18 @@ def cleanup(self) -> None:
+         except Exception:
+             logger.exception("Error during SharedDataManager shutdown")
+ 
++        # Remove socket file if it still exists.  The Manager server
++        # process normally unlinks it on exit, but if it was killed
++        # (SIGKILL) the file may be left behind.
++        socket_path = getattr(self, "_socket_path", None)
++        if socket_path:
++            try:
++                os.unlink(socket_path)
++            except FileNotFoundError:
++                pass
++            except OSError as e:
++                logger.debug("Could not remove socket file %s: %s", socket_path, e)
++
+     def deregister_child(self) -> None:
+         """Remove the Manager's server process from multiprocessing's child tracking.
+ 
+diff --git a/test-requirements.txt b/test-requirements.txt
+index bdd44e3e9..bf74580a9 100644
+--- a/test-requirements.txt
++++ b/test-requirements.txt
+@@ -1,6 +1,7 @@
+ dbus-python
+ # modules required for pylint
+ setuptools
++pytest
+ # packages required for mypy
+ sqlalchemy-stubs
+ types-python-dateutil
+diff --git a/test/conftest.py b/test/conftest.py
+new file mode 100644
+index 000000000..da2843922
+--- /dev/null
++++ b/test/conftest.py
+@@ -0,0 +1,30 @@
++"""Shared pytest fixtures for keylime tests."""
++
++import shutil
++import tempfile
++from unittest.mock import patch
++
++import pytest
++
++from keylime.shared_data import cleanup_global_shared_memory
++
++
++@pytest.fixture(autouse=True)
++def _shared_data_runtime_dir():
++    """Redirect SharedDataManager sockets to a temporary directory.
++
++    The SyncManager creates Unix domain sockets in /var/run/keylime/,
++    which may not be writable by the test user.  This fixture patches
++    the runtime directory to a per-test temp directory so that tests
++    work in any environment.
++
++    After each test, any global SharedDataManager is shut down to
++    prevent stale managers from referencing deleted temp directories.
++    """
++    tmpdir = tempfile.mkdtemp()
++    with patch("keylime.shared_data._RUNTIME_DIR", tmpdir):
++        yield
++    # Shut down any global SharedDataManager left alive by the test
++    # so the next test starts fresh with a new temp directory.
++    cleanup_global_shared_memory()
++    shutil.rmtree(tmpdir, ignore_errors=True)
+
+From 712ab6c841e258e463f858904bfc0991f704a3b9 Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Thu, 16 Apr 2026 14:14:45 +0200
+Subject: [PATCH 2/2] installer: Add tmpfiles.d config for all keylime
+ directories
+
+Add keylime-tmpfiles.conf to manage all keylime directories.
+
+This includes:
+
+- /var/run/keylime (runtime IPC sockets)
+- /var/lib/keylime (persistent state)
+- /etc/keylime and config snippet directories (configuration)
+- TPM certificate store copy from /usr/share to /var/lib
+
+Simplify installer.sh to avoid redundant directory creation and
+ownership setting.  The installer only needs to install the tmpfiles.d
+config to /usr/lib/tmpfiles.d/keylime.conf and apply it immediately with
+systemd-tmpfiles --create so the directories exist before the services
+start.
+
+The installer validates the TPM cert store source exists before copying
+and includes a non-systemd fallback for manual directory creation.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ services/installer.sh          | 61 ++++++++++++++++++++++++++--------
+ services/keylime-tmpfiles.conf | 40 ++++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 14 deletions(-)
+ create mode 100644 services/keylime-tmpfiles.conf
+
+diff --git a/services/installer.sh b/services/installer.sh
+index f34027c61..f462f136b 100755
+--- a/services/installer.sh
++++ b/services/installer.sh
+@@ -11,7 +11,7 @@ fi
+ BASEDIR=$(dirname "$0")
+ 
+ # check keylime scripts directory (same for verifier, agent, registrar)
+-KEYLIMEDIR=$(dirname $(whereis keylime_verifier | cut -d " " -f 2))
++KEYLIMEDIR=$(dirname "$(whereis keylime_verifier | cut -d " " -f 2)")
+ if [[ $KEYLIMEDIR == "." ]]; then
+     echo "Unable to find keylime scripts" 1>&2
+     exit 1
+@@ -20,8 +20,8 @@ fi
+ echo "Using keylime scripts directory: ${KEYLIMEDIR}"
+ 
+ # prepare keylime service files and store them in systemd path
+-sed "s|KEYLIMEDIR|$KEYLIMEDIR|g" $BASEDIR/keylime_registrar.service.template > /etc/systemd/system/keylime_registrar.service
+-sed "s|KEYLIMEDIR|$KEYLIMEDIR|g" $BASEDIR/keylime_verifier.service.template > /etc/systemd/system/keylime_verifier.service
++sed "s|KEYLIMEDIR|$KEYLIMEDIR|g" "$BASEDIR/keylime_registrar.service.template" > /etc/systemd/system/keylime_registrar.service
++sed "s|KEYLIMEDIR|$KEYLIMEDIR|g" "$BASEDIR/keylime_verifier.service.template" > /etc/systemd/system/keylime_verifier.service
+ 
+ echo "Creating keylime user if it not exists"
+ if ! getent passwd keylime >/dev/null; then
+@@ -30,23 +30,56 @@ if ! getent passwd keylime >/dev/null; then
+             keylime
+ fi
+ 
+-echo "Changing files to be owned by the keylime user"
+-# Create all directories required if not there
+-mkdir -p /var/lib/keylime
+-mkdir -p /var/log/keylime
+-mkdir -p /var/run/keylime
++# install TPM certificate store to /usr/share/keylime/
++# tmpfiles.d will copy this to /var/lib/keylime/tpm_cert_store
++TPM_CERT_STORE_SRC="$BASEDIR/../tpm_cert_store"
++if [[ ! -d "$TPM_CERT_STORE_SRC" ]]; then
++    echo "Missing TPM certificate store: $TPM_CERT_STORE_SRC" 1>&2
++    exit 1
++fi
++
++mkdir -p /usr/share/keylime
++cp -a "$TPM_CERT_STORE_SRC" /usr/share/keylime/ || exit 1
+ 
+-chown keylime:keylime -R /etc/keylime
+-chown keylime:keylime -R /var/lib/keylime
+-chown keylime:keylime -R /var/log/keylime
+-chown keylime:keylime -R /var/run/keylime
++# install tmpfiles.d config for keylime directories
++mkdir -p /usr/lib/tmpfiles.d
++cp "$BASEDIR/keylime-tmpfiles.conf" /usr/lib/tmpfiles.d/keylime.conf
++
++# apply the tmpfiles.d config immediately to create directories with correct ownership
++if command -v systemd-tmpfiles >/dev/null 2>&1; then
++    systemd-tmpfiles --create keylime.conf
++else
++    echo "Warning: systemd-tmpfiles not found, creating directories manually"
++    # Create essential directories as fallback for non-systemd systems
++    mkdir -p /var/run/keylime /var/lib/keylime \
++        /etc/keylime/ca.conf.d \
++        /etc/keylime/logging.conf.d \
++        /etc/keylime/verifier.conf.d \
++        /etc/keylime/registrar.conf.d \
++        /etc/keylime/tenant.conf.d \
++        /etc/keylime/agent.conf.d
++    chown keylime:keylime /var/run/keylime /var/lib/keylime
++    chmod 700 /var/run/keylime /var/lib/keylime
++    # Mirror tmpfiles.d Z/z semantics: recursively set ownership and
++    # file permissions under /etc/keylime, then fix directories to 0500.
++    chown -R keylime:keylime /etc/keylime
++    find /etc/keylime -type f -exec chmod 400 {} \;
++    find /etc/keylime -type d -exec chmod 500 {} \;
++    # Copy TPM cert store from /usr/share to /var/lib only if the
++    # target does not exist yet (mirrors the tmpfiles.d C directive).
++    # This preserves operator-added EK certificates.
++    if [ -d /usr/share/keylime/tpm_cert_store ] && [ ! -d /var/lib/keylime/tpm_cert_store ]; then
++        cp -r /usr/share/keylime/tpm_cert_store /var/lib/keylime/
++        chown -R keylime:keylime /var/lib/keylime/tpm_cert_store
++        find /var/lib/keylime/tpm_cert_store -type f -exec chmod 400 {} \;
++        chmod 500 /var/lib/keylime/tpm_cert_store
++    fi
++fi
+ 
+ # set permissions
+ chmod 664 /etc/systemd/system/keylime_registrar.service
+ chmod 664 /etc/systemd/system/keylime_verifier.service
+ 
+-chmod 700 /var/run/keylime
+-
+ # enable at startup
+ systemctl enable keylime_registrar.service
+ systemctl enable keylime_verifier.service
+diff --git a/services/keylime-tmpfiles.conf b/services/keylime-tmpfiles.conf
+new file mode 100644
+index 000000000..f3c0b43d6
+--- /dev/null
++++ b/services/keylime-tmpfiles.conf
+@@ -0,0 +1,40 @@
++d /run/keylime 0700 keylime keylime -
++
++d /var/lib/keylime 0700 keylime keylime -
++
++d /etc/keylime 0500 keylime keylime -
++d /etc/keylime/ca.conf.d 0500 keylime keylime -
++d /etc/keylime/logging.conf.d 0500 keylime keylime -
++d /etc/keylime/verifier.conf.d 0500 keylime keylime -
++d /etc/keylime/registrar.conf.d 0500 keylime keylime -
++d /etc/keylime/tenant.conf.d 0500 keylime keylime -
++d /etc/keylime/agent.conf.d 0500 keylime keylime -
++
++# TPM certificate store.
++# Copy the cert store from /usr/share/keylime/tpm_cert_store
++# to /var/lib/keylime/tpm_cert_store.
++# Files inside /var/lib/keylime/tpm_cert_store/ have
++# 0400 permission and are owned by keylime/keylime,
++# while /var/lib/keylime/tpm_cert_store/ itself has
++# permission 0500, also owned by keylime/keylime.
++C /var/lib/keylime/tpm_cert_store 0500 keylime keylime - /usr/share/keylime/tpm_cert_store
++Z /var/lib/keylime/tpm_cert_store 0400 keylime keylime -
++z /var/lib/keylime/tpm_cert_store 0500 keylime keylime -
++# Finally, /var/lib/keylime itself has 0700 permission,
++# and is owned by keylime/keylime.
++z /var/lib/keylime 0700 keylime keylime -
++
++# Keylime configuration in /etc/keylime has permission 0400
++# owned by keylime/keylime, while snippet directories and
++# the actual /etc/keylime directory have permission 0500,
++# also owned by keylime/keylime.
++Z /etc/keylime 0400 keylime keylime -
++# Now fix the directories:
++z /etc/keylime/ca.conf.d 0500 keylime keylime -
++z /etc/keylime/logging.conf.d 0500 keylime keylime -
++z /etc/keylime/verifier.conf.d 0500 keylime keylime -
++z /etc/keylime/registrar.conf.d 0500 keylime keylime -
++z /etc/keylime/tenant.conf.d 0500 keylime keylime -
++z /etc/keylime/agent.conf.d 0500 keylime keylime -
++# And finally, /etc/keylime itself.
++z /etc/keylime 0500 keylime keylime -

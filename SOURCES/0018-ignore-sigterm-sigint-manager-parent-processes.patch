@@ -1,0 +1,151 @@
+From 15f20d2dd2e63cc621295befef46bc4161a1f636 Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Fri, 10 Apr 2026 13:22:44 +0200
+Subject: [PATCH] shared_data: Ignore SIGTERM and SIGINT on Manager and parent
+ processes
+
+When systemd stops the verifier (or registrar), SIGTERM is delivered to
+the entire process group, including the multiprocessing Manager's server
+process that hosts the shared policy cache.  The Manager dies
+immediately, but worker processes still have in-flight process_agent()
+coroutines that need the cache, causing ConnectionResetError.
+
+The same race occurs with SIGINT (Ctrl+C) when running the daemon in
+the foreground.
+
+Fix this in two parts:
+
+1. Use SyncManager.start(initializer=...) to install SIG_IGN for both
+   SIGTERM and SIGINT in the Manager's server process, so it survives
+   process-group signals and stays available while workers drain.
+
+2. Ignore SIGTERM and SIGINT in the new architecture's parent process
+   (start_multi) so it stays in tornado's monitor loop until all
+   children have drained and exited.  Once all children exit, tornado
+   calls sys.exit(0), triggering atexit handlers which shut down the
+   Manager via IPC.  Without this, the default signal disposition kills
+   the parent immediately (no atexit), leaving the Manager orphaned.
+
+Resolves: #1882
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/shared_data.py       | 28 +++++++++++++++++++++++++++-
+ keylime/web/base/server.py   | 18 ++++++++++++++++++
+ test/test_verifier_server.py | 11 ++++++++---
+ 3 files changed, 53 insertions(+), 4 deletions(-)
+
+diff --git a/keylime/shared_data.py b/keylime/shared_data.py
+index 09cbb97bb..494f2f53b 100644
+--- a/keylime/shared_data.py
++++ b/keylime/shared_data.py
+@@ -8,8 +8,10 @@
+ import multiprocessing as mp
+ import multiprocessing.process
+ import os
++import signal
+ import threading
+ import time
++from multiprocessing.managers import SyncManager
+ from typing import Any, Dict, List, Optional
+ 
+ from keylime import keylime_logging
+@@ -17,6 +19,17 @@
+ logger = keylime_logging.init_logging("shared_data")
+ 
+ 
++def _manager_ignore_signals() -> None:
++    """Ignore SIGTERM and SIGINT in the Manager's server process.
++
++    Called as the ``initializer`` for ``SyncManager.start()`` so that
++    the Manager survives process-group signals (systemd SIGTERM, Ctrl+C)
++    and stays available while workers drain in-flight work.
++    """
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++    signal.signal(signal.SIGINT, signal.SIG_IGN)
++
++
+ class FlatDictView:
+     """A dictionary-like view over a flat key-value store.
+ 
+@@ -127,7 +140,20 @@ def __init__(self) -> None:
+         # Use explicit context to ensure fork compatibility
+         # The Manager must be started BEFORE any fork() calls
+         ctx = mp.get_context("fork")
+-        self._manager = ctx.Manager()
++        # Use SyncManager directly (instead of the ctx.Manager() shortcut)
++        # so we can pass an initializer that makes the Manager's server
++        # process ignore SIGTERM and SIGINT.  Without this, systemd's
++        # cgroup-wide SIGTERM (or Ctrl+C SIGINT in foreground) kills the
++        # Manager before workers finish draining, causing
++        # ConnectionResetError in proxy objects.  The Manager is still
++        # cleanable via IPC shutdown message, process.kill(), or systemd
++        # SIGKILL escalation.
++        # Cannot use 'with' context manager here: the Manager must outlive
++        # __init__ and persist for the lifetime of SharedDataManager.
++        self._manager = SyncManager(ctx=ctx)
++        self._manager.start(  # pylint: disable=consider-using-with
++            initializer=_manager_ignore_signals,
++        )
+ 
+         # CRITICAL FIX: Use a SINGLE flat dict instead of nested dicts
+         # Nested DictProxy objects have synchronization issues
+diff --git a/keylime/web/base/server.py b/keylime/web/base/server.py
+index 4dd02b79e..8e9cce69d 100644
+--- a/keylime/web/base/server.py
++++ b/keylime/web/base/server.py
+@@ -376,12 +376,30 @@ def start_multi(self) -> None:
+ 
+         self._pre_fork()
+ 
++        # Ignore SIGTERM/SIGINT in the parent so it stays in tornado's
++        # monitor loop (os.wait) until all children have drained and
++        # exited cleanly.  Once all children exit, tornado calls
++        # sys.exit(0) which triggers atexit → SharedDataManager.cleanup()
++        # → Manager shutdown via IPC.  Without this, the default signal
++        # disposition kills the parent immediately (no atexit), leaving
++        # the Manager process orphaned.
++        # Children inherit SIG_IGN but override it in
++        # _install_signal_handlers() before entering the event loop.
++        signal.signal(signal.SIGTERM, signal.SIG_IGN)
++        signal.signal(signal.SIGINT, signal.SIG_IGN)
++
+         # with StatsCollector():
+         # num = manager.Value('i', 0)
+         task_id = tornado.process.fork_processes(self.worker_count)
+         # num.value = num.value + 1
+         # print(num.value)
+ 
++        # Restore default signal disposition in children so they don't
++        # silently ignore SIGTERM/SIGINT before _install_signal_handlers()
++        # replaces these with asyncio-based handlers in start_single().
++        signal.signal(signal.SIGTERM, signal.SIG_DFL)
++        signal.signal(signal.SIGINT, signal.SIG_DFL)
++
+         # Remove the Manager's server process from multiprocessing's child
+         # tracking so Python's atexit handler does not try to join() it in
+         # child workers (the Manager was spawned by the parent).
+diff --git a/test/test_verifier_server.py b/test/test_verifier_server.py
+index e9a47ef70..7601b9cb0 100644
+--- a/test/test_verifier_server.py
++++ b/test/test_verifier_server.py
+@@ -300,10 +300,15 @@ def test_base_server_calls_post_fork_before_start_single(self):
+         assert match is not None
+         method_body = match.group(0)
+ 
++        # Strip comment lines to avoid false matches from mentions
++        # in comments (e.g. "# ... before start_single()").
++        code_lines = [line for line in method_body.splitlines() if not line.lstrip().startswith("#")]
++        code_body = "\n".join(code_lines)
++
+         # Extract the order of operations
+-        fork_index = method_body.find("fork_processes")
+-        post_fork_index = method_body.find("_post_fork")
+-        start_single_index = method_body.find("start_single()")
++        fork_index = code_body.find("fork_processes")
++        post_fork_index = code_body.find("_post_fork")
++        start_single_index = code_body.find("start_single()")
+ 
+         # All should be present
+         self.assertNotEqual(fork_index, -1, "fork_processes call not found")
