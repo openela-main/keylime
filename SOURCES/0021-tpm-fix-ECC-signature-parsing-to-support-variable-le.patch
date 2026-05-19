@@ -1,0 +1,372 @@
+From ee4192df70384fa6b23f359a287e042103ba4ea9 Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Thu, 25 Sep 2025 14:37:10 +0100
+Subject: [PATCH 18/18] tpm: fix ECC signature parsing to support
+ variable-length coordinates
+
+The previous ECC signature validation implementation incorrectly assumed
+fixed-length coordinate encoding, causing failures with mathematically
+correct variable-length coordinates (especially P-521 curves where
+coordinates are typically 65-66 bytes).
+
+This commit fixes the ecdsa_der_from_tpm() function to properly handle
+TSS ESAPI signature format where the sig_size field contains only the
+r component size, followed by the s component with its own size header.
+
+This enables proper ECC attestation for the supported NIST curves.
+
+Assisted-by: Claude 4 Sonnet
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ keylime/tpm/tpm_main.py   |   2 +-
+ keylime/tpm/tpm_util.py   | 105 +++++++++++++++++++---
+ test/test_tpm2_objects.py | 184 +++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 277 insertions(+), 14 deletions(-)
+
+diff --git a/keylime/tpm/tpm_main.py b/keylime/tpm/tpm_main.py
+index 6f2e89f..ecbacbe 100644
+--- a/keylime/tpm/tpm_main.py
++++ b/keylime/tpm/tpm_main.py
+@@ -91,7 +91,7 @@ class Tpm:
+         if isinstance(iak_pub, EllipticCurvePublicKey):
+             if sig_alg in [tpm2_objects.TPM_ALG_ECDSA]:
+                 try:
+-                    der_sig = tpm_util.ecdsa_der_from_tpm(iak_sign)
++                    der_sig = tpm_util.ecdsa_der_from_tpm(iak_sign, iak_pub)
+                     tpm_util.verify(iak_pub, der_sig, digest, hashfunc)
+                     logger.info("Agent %s AIK verified with IAK", uuid)
+                     return True
+diff --git a/keylime/tpm/tpm_util.py b/keylime/tpm/tpm_util.py
+index fbbe557..f554f94 100644
+--- a/keylime/tpm/tpm_util.py
++++ b/keylime/tpm/tpm_util.py
+@@ -59,6 +59,43 @@ logger = keylime_logging.init_logging("tpm_util")
+ 
+ SupportedKeyTypes = Union[RSAPublicKey, EllipticCurvePublicKey]
+ 
++# ECC signature parsing constants.
++# Raw signature sizes for different ECC curves (r||s concatenated format).
++# r and s are the two mathematical components of an ECDSA signature.
++ECC_SECP192R1_SIGNATURE_SIZE = 48  # 24 bytes each for r,s.
++ECC_SECP224R1_SIGNATURE_SIZE = 56  # 28 bytes each for r,s.
++ECC_SECP256R1_SIGNATURE_SIZE = 64  # 32 bytes each for r,s.
++ECC_SECP384R1_SIGNATURE_SIZE = 96  # 48 bytes each for r,s.
++ECC_SECP521R1_SIGNATURE_SIZE = 132  # 66 bytes each for r,s.
++
++# TPM2B_ECDSA_SIGNATURE format constants.
++TPM2B_SIZE_FIELD_LENGTH = 2  # 2 bytes for size field.
++TPM2B_MIN_HEADER_SIZE = 4  # Minimum: 2 bytes r_size + 2 bytes s_size.
++
++# DER encoding constants.
++DER_SEQUENCE_TAG = 0x30
++
++# Signature blob header offset (skip alg, hash_alg, sig_size headers).
++SIGNATURE_BLOB_HEADER_SIZE = 6
++
++# ECC curve to signature size mapping for raw r||s format.
++ECC_RAW_SIGNATURE_SIZES = {
++    "secp192r1": ECC_SECP192R1_SIGNATURE_SIZE,
++    "secp224r1": ECC_SECP224R1_SIGNATURE_SIZE,
++    "secp256r1": ECC_SECP256R1_SIGNATURE_SIZE,
++    "secp384r1": ECC_SECP384R1_SIGNATURE_SIZE,
++    "secp521r1": ECC_SECP521R1_SIGNATURE_SIZE,
++}
++
++# ECC curve coordinate size ranges (min, max) for validation.
++ECC_COORDINATE_SIZE_RANGES = {
++    "secp192r1": (1, 24),  # 192 bits = 24 bytes max
++    "secp224r1": (1, 28),  # 224 bits = 28 bytes max
++    "secp256r1": (1, 32),  # 256 bits = 32 bytes max
++    "secp384r1": (1, 48),  # 384 bits = 48 bytes max
++    "secp521r1": (1, 66),  # 521 bits = 66 bytes max (521 bits, not 512)
++}
++
+ 
+ def verify(
+     pubkey: SupportedKeyTypes,
+@@ -106,17 +143,59 @@ def der_len(encoded_int_len: int) -> bytes:
+     return bytes((0x80 | len(bin_str),)) + bin_str
+ 
+ 
+-def ecdsa_der_from_tpm(sigblob: bytes) -> bytes:
+-    _, _, sig_size_r = struct.unpack_from(">HHH", sigblob, 0)
+-    sig_r = sigblob[6 : 6 + sig_size_r]
+-    encoded_sig_r = der_int(sig_r)
+-    sigblob = sigblob[6 + sig_size_r :]
+-    sig_size_s = struct.unpack_from(">H", sigblob, 0)[0]
+-    sig_s = sigblob[2 : 2 + sig_size_s]
+-    encoded_sig_s = der_int(sig_s)
+-    total_size = len(encoded_sig_r) + len(encoded_sig_s)
+-    der_sig = bytes.fromhex(f"30{total_size:x}") + encoded_sig_r + encoded_sig_s
+-    return der_sig
++def ecdsa_der_from_tpm(sigblob: bytes, pubkey: EllipticCurvePublicKey) -> bytes:
++    """Convert ECC signature from TPM format to DER format for cryptographic verification.
++
++    This function handles TSS ESAPI signature format where the signature header's
++    sig_size field contains the size of the r component, followed by the s component
++    with its own size header.
++
++    Parameters
++    ----------
++    sigblob: TPM signature blob containing signature headers and signature data
++    pubkey: ECC public key to determine expected signature size
++
++    Returns
++    -------
++    DER-encoded ECDSA signature suitable for cryptographic library verification
++
++    Raises
++    ------
++    ValueError: If signature format cannot be parsed or is invalid
++    """
++    # Extract signature header information.
++    _sig_alg, _hash_alg, sig_size_r = struct.unpack_from(">HHH", sigblob, 0)
++
++    # Extract the r component (size is in sig_size_r field).
++    sig_r = sigblob[SIGNATURE_BLOB_HEADER_SIZE : SIGNATURE_BLOB_HEADER_SIZE + sig_size_r]
++
++    # The s component follows immediately after r, with its own size header.
++    s_offset = SIGNATURE_BLOB_HEADER_SIZE + sig_size_r
++    if s_offset + 2 <= len(sigblob):
++        sig_size_s = struct.unpack_from(">H", sigblob, s_offset)[0]
++        s_start = s_offset + 2
++        if s_start + sig_size_s <= len(sigblob):
++            sig_s = sigblob[s_start : s_start + sig_size_s]
++
++            # Validate coordinate sizes against curve requirements.
++            curve_name = pubkey.curve.name
++            coordinate_range = ECC_COORDINATE_SIZE_RANGES.get(curve_name)
++            if coordinate_range:
++                min_size, max_size = coordinate_range
++                if not min_size <= len(sig_r) <= max_size:
++                    raise ValueError(f"Invalid r coordinate size {len(sig_r)} for curve {curve_name}")
++                if not min_size <= len(sig_s) <= max_size:
++                    raise ValueError(f"Invalid s coordinate size {len(sig_s)} for curve {curve_name}")
++
++            # Convert to DER format.
++            encoded_sig_r = der_int(sig_r)
++            encoded_sig_s = der_int(sig_s)
++            total_size = len(encoded_sig_r) + len(encoded_sig_s)
++            der_length = der_len(total_size)
++            der_sig = bytes([DER_SEQUENCE_TAG]) + der_length + encoded_sig_r + encoded_sig_s
++            return der_sig
++
++    raise ValueError("Unable to parse ECC signature from TPM format")
+ 
+ 
+ def __get_pcrs_from_blob(pcrblob: bytes) -> Tuple[int, Dict[int, int], List[bytes]]:
+@@ -238,7 +317,9 @@ def checkquote(
+         (sig_size,) = struct.unpack_from(">H", sigblob, 4)
+         (signature,) = struct.unpack_from(f"{sig_size}s", sigblob, 6)
+     elif sig_alg in [tpm2_objects.TPM_ALG_ECDSA]:
+-        signature = ecdsa_der_from_tpm(sigblob)
++        if not isinstance(pubkey, EllipticCurvePublicKey):
++            raise ValueError(f"ECDSA signature algorithm requires EllipticCurvePublicKey, got {type(pubkey)}")
++        signature = ecdsa_der_from_tpm(sigblob, pubkey)
+     else:
+         raise ValueError(f"Unsupported quote signature algorithm '{sig_alg:#x}'")
+ 
+diff --git a/test/test_tpm2_objects.py b/test/test_tpm2_objects.py
+index 48d6a43..c0e4c0a 100644
+--- a/test/test_tpm2_objects.py
++++ b/test/test_tpm2_objects.py
+@@ -16,7 +16,7 @@ from keylime.tpm.tpm2_objects import (
+     pubkey_parms_from_tpm2b_public,
+     tpms_ecc_point_marshal,
+ )
+-from keylime.tpm.tpm_util import crypt_secret_encrypt_ecc
++from keylime.tpm.tpm_util import crypt_secret_encrypt_ecc, der_int, der_len, ecdsa_der_from_tpm
+ 
+ 
+ class TestTpm2Objects(unittest.TestCase):
+@@ -543,5 +543,187 @@ class TestEccMarshaling(unittest.TestCase):
+         self.assertEqual(data_sizes[0], hashfunc.digest_size, "Data size should match hash digest size")
+ 
+ 
++class TestEccSignatureParsing(unittest.TestCase):
++    """Test ECC signature parsing improvements for variable-length coordinates"""
++
++    def create_test_signature_blob(self, sig_r: bytes, sig_s: bytes) -> bytes:
++        """Create a test TPM signature blob with given r and s components"""
++        # TPM signature format: sig_alg(2) + hash_alg(2) + sig_size_r(2) + r_data + sig_size_s(2) + s_data
++        sig_alg = 0x0018  # TPM_ALG_ECDSA
++        hash_alg = 0x000B  # TPM_ALG_SHA256
++
++        blob = struct.pack(">HHH", sig_alg, hash_alg, len(sig_r))
++        blob += sig_r
++        blob += struct.pack(">H", len(sig_s))
++        blob += sig_s
++
++        return blob
++
++    def test_p521_variable_length_coordinates(self):
++        """Test that P-521 signatures with variable-length coordinates are parsed correctly"""
++        # Generate a P-521 key for testing
++        private_key = ec.generate_private_key(ec.SECP521R1())
++        public_key = private_key.public_key()
++
++        # Test with 65-byte coordinates (leading zero stripped)
++        sig_r_65 = b"\x00" * 1 + b"\x01" * 64  # 65 bytes
++        sig_s_65 = b"\x00" * 1 + b"\x02" * 64  # 65 bytes
++
++        blob_65 = self.create_test_signature_blob(sig_r_65, sig_s_65)
++
++        # Should parse successfully
++        der_sig_65 = ecdsa_der_from_tpm(blob_65, public_key)
++        self.assertIsInstance(der_sig_65, bytes)
++        self.assertTrue(len(der_sig_65) > 0)
++
++        # Test with 66-byte coordinates (full padding)
++        sig_r_66 = b"\x00" * 2 + b"\x01" * 64  # 66 bytes
++        sig_s_66 = b"\x00" * 2 + b"\x02" * 64  # 66 bytes
++
++        blob_66 = self.create_test_signature_blob(sig_r_66, sig_s_66)
++
++        # Should parse successfully
++        der_sig_66 = ecdsa_der_from_tpm(blob_66, public_key)
++        self.assertIsInstance(der_sig_66, bytes)
++        self.assertTrue(len(der_sig_66) > 0)
++
++    def test_coordinate_size_validation(self):
++        """Test that coordinate size validation works for different curves"""
++        # Test P-256 with valid coordinates
++        p256_key = ec.generate_private_key(ec.SECP256R1()).public_key()
++
++        # Valid P-256 coordinates (32 bytes each)
++        sig_r_32 = b"\x01" * 32
++        sig_s_32 = b"\x02" * 32
++        blob_p256_valid = self.create_test_signature_blob(sig_r_32, sig_s_32)
++
++        # Should parse successfully
++        der_sig = ecdsa_der_from_tpm(blob_p256_valid, p256_key)
++        self.assertIsInstance(der_sig, bytes)
++
++        # Test P-256 with invalid coordinates (too large)
++        sig_r_invalid = b"\x01" * 50  # Too large for P-256
++        sig_s_invalid = b"\x02" * 50  # Too large for P-256
++        blob_p256_invalid = self.create_test_signature_blob(sig_r_invalid, sig_s_invalid)
++
++        # Should raise ValueError
++        with self.assertRaises(ValueError) as cm:
++            ecdsa_der_from_tpm(blob_p256_invalid, p256_key)
++        self.assertIn("Invalid r coordinate size", str(cm.exception))
++
++    def test_signature_parsing_edge_cases(self):
++        """Test edge cases in signature parsing"""
++        p256_key = ec.generate_private_key(ec.SECP256R1()).public_key()
++
++        # Test with truncated blob (missing s component)
++        truncated_blob = struct.pack(">HHH", 0x0018, 0x000B, 32) + b"\x01" * 32
++        # Missing s component
++
++        with self.assertRaises(ValueError) as cm:
++            ecdsa_der_from_tpm(truncated_blob, p256_key)
++        self.assertIn("Unable to parse ECC signature", str(cm.exception))
++
++        # Test with blob too short for s size header
++        short_blob = struct.pack(">HHH", 0x0018, 0x000B, 32) + b"\x01" * 32 + b"\x00"  # Only 1 byte for s size
++
++        with self.assertRaises(ValueError) as cm:
++            ecdsa_der_from_tpm(short_blob, p256_key)
++        self.assertIn("Unable to parse ECC signature", str(cm.exception))
++
++    def test_der_encoding_correctness(self):
++        """Test that DER encoding produces correctly formatted output"""
++        p256_key = ec.generate_private_key(ec.SECP256R1()).public_key()
++
++        # Create test coordinates
++        sig_r = b"\x01" * 32
++        sig_s = b"\x02" * 32
++        blob = self.create_test_signature_blob(sig_r, sig_s)
++
++        der_sig = ecdsa_der_from_tpm(blob, p256_key)
++
++        # DER signature should start with SEQUENCE tag (0x30)
++        self.assertEqual(der_sig[0], 0x30, "DER signature should start with SEQUENCE tag")
++
++        # Should be parseable as DER format
++        # The structure should be: 0x30 + length + INTEGER(r) + INTEGER(s)
++        self.assertTrue(len(der_sig) >= 6, "DER signature should have minimum length")
++
++    def test_multiple_curve_support(self):
++        """Test that signature parsing works for multiple curve types"""
++        test_cases = [
++            (ec.SECP256R1(), 32),
++            (ec.SECP384R1(), 48),
++            (ec.SECP521R1(), 66),
++        ]
++
++        for curve, coord_size in test_cases:
++            with self.subTest(curve=curve.name):
++                private_key = ec.generate_private_key(curve)
++                public_key = private_key.public_key()
++
++                # Create test signature with appropriate coordinate size
++                sig_r = b"\x01" * coord_size
++                sig_s = b"\x02" * coord_size
++                blob = self.create_test_signature_blob(sig_r, sig_s)
++
++                # Should parse successfully
++                der_sig = ecdsa_der_from_tpm(blob, public_key)
++                self.assertIsInstance(der_sig, bytes)
++                self.assertTrue(len(der_sig) > 0)
++                self.assertEqual(der_sig[0], 0x30)  # DER SEQUENCE tag
++
++    def test_der_int_encoding(self):
++        """Test DER integer encoding helper function"""
++        # Test positive number that doesn't need padding
++        test_bytes = b"\x7F"  # 127, no padding needed
++        der_encoded = der_int(test_bytes)
++        expected = b"\x02\x01\x7F"  # INTEGER tag + length + value
++        self.assertEqual(der_encoded, expected)
++
++        # Test positive number that needs zero padding (high bit set)
++        test_bytes = b"\xFF"  # 255, needs zero padding
++        der_encoded = der_int(test_bytes)
++        expected = b"\x02\x02\x00\xFF"  # INTEGER tag + length + zero padding + value
++        self.assertEqual(der_encoded, expected)
++
++    def test_der_len_encoding(self):
++        """Test DER length encoding helper function"""
++        # Test short form (< 128)
++        short_len = der_len(50)
++        self.assertEqual(short_len, b"\x32")  # 50 in hex
++
++        # Test long form (>= 128)
++        long_len = der_len(300)  # 0x012C
++        expected = b"\x82\x01\x2C"  # Long form: 0x80 | 2 bytes, then 0x012C
++        self.assertEqual(long_len, expected)
++
++    def test_signature_format_validation_comprehensive(self):
++        """Comprehensive test of signature format validation"""
++        p521_key = ec.generate_private_key(ec.SECP521R1()).public_key()
++
++        # Test minimum valid coordinate sizes for P-521
++        valid_sizes = [65, 66]
++        for size in valid_sizes:
++            sig_r = b"\x01" * size
++            sig_s = b"\x02" * size
++            blob = self.create_test_signature_blob(sig_r, sig_s)
++
++            # Should not raise exception
++            der_sig = ecdsa_der_from_tpm(blob, p521_key)
++            self.assertIsInstance(der_sig, bytes)
++
++        # Test invalid coordinate sizes for P-521 (outside the 1-66 range)
++        invalid_sizes = [0, 67, 100]  # 0 is too small, 67+ is too large
++        for size in invalid_sizes:
++            with self.subTest(size=size):
++                sig_r = b"\x01" * size if size > 0 else b""
++                sig_s = b"\x02" * size if size > 0 else b""
++                blob = self.create_test_signature_blob(sig_r, sig_s)
++
++                with self.assertRaises(ValueError) as cm:
++                    ecdsa_der_from_tpm(blob, p521_key)
++                self.assertIn("coordinate size", str(cm.exception))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.47.3
+

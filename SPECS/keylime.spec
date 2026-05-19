@@ -9,7 +9,7 @@
 
 Name:    keylime
 Version: 7.12.1
-Release: 11%{?dist}.5
+Release: 15%{?dist}
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -48,14 +48,21 @@ Patch: 0013-fix-malformed-certs-workaround.patch
 Patch: 0014-Add-shared-memory-infrastructure-for-multiprocess-co.patch
 Patch: 0015-Fix-registrar-duplicate-UUID-vulnerability.patch
 
-# CVE-2026-1709
-Patch: 0016-CVE-2026-1709.patch
+# Backported from:
+# - https://github.com/keylime/keylime/pull/1746
+# - https://github.com/keylime/keylime/pull/1803
+# - https://github.com/keylime/keylime/pull/1808
+# ECC attestation support.
+Patch: 0016-algorithms-add-support-for-specific-ECC-curve-algori.patch
+Patch: 0017-algorithms-add-support-for-specific-RSA-algorithms.patch
+Patch: 0018-tpm_util-fix-quote-signature-extraction-for-ECDSA.patch
+Patch: 0019-tpm-fix-ECC-P-521-coordinate-validation.patch
+Patch: 0020-tpm-fix-ECC-P-521-credential-activation-with-consist.patch
+Patch: 0021-tpm-fix-ECC-signature-parsing-to-support-variable-le.patch
 
-# Tenant version negotiation.
-# Backport from:
-# - https://github.com/keylime/keylime/pull/1838
-# - https://github.com/keylime/keylime/pull/1845
-Patch: 0017-Backport-tenant-version-negotiation-mechanism.patch
+# CVE-2026-1709
+# Fix registrar authentication bypass
+Patch: 0022-CVE-2026-1709.patch
 
 License: ASL 2.0 and MIT
 
@@ -109,7 +116,8 @@ Requires: openssl
 %if 0%{?with_selinux}
 # This ensures that the *-selinux package and all it’s dependencies are not pulled
 # into containers and other systems that do not use SELinux
-Recommends:       (%{srcname}-selinux if selinux-policy-%{selinuxtype})
+Recommends:       (%{srcname}-selinux = %{version}-%{release} if selinux-policy-%{selinuxtype})
+
 %endif
 
 %ifarch %efi
@@ -435,8 +443,8 @@ fi
 %config(noreplace) %verify(not md5 size mode mtime) %attr(400,%{srcname},%{srcname}) %{_sysconfdir}/%{srcname}/logging.conf
 %attr(700,%{srcname},%{srcname}) %dir %{_rundir}/%{srcname}
 %attr(700,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}
-%attr(500,%{srcname},%{srcname}) %dir %{_datadir}/%{srcname}/tpm_cert_store
-%attr(400,%{srcname},%{srcname}) %{_datadir}/%{srcname}/tpm_cert_store/*.pem
+%attr(755,root,root) %dir %{_datadir}/%{srcname}/tpm_cert_store
+%attr(644,root,root) %{_datadir}/%{srcname}/tpm_cert_store/*.pem
 %attr(500,%{srcname},%{srcname}) %dir %{_sharedstatedir}/%{srcname}/tpm_cert_store
 %attr(400,%{srcname},%{srcname}) %{_sharedstatedir}/%{srcname}/tpm_cert_store/*.pem
 %{_tmpfilesdir}/%{srcname}.conf
@@ -450,17 +458,21 @@ fi
 %license LICENSE
 
 %changelog
-* Fri Apr 17 2026 Sergio Correia <scorreia@redhat.com> - 7.12.1-11.5
-- Add API version negotiation to keylime_tenant
-  Resolves: RHEL-154784
+* Fri Feb 13 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-15
+- Fix registrar authentication bypass (CVE-2026-1709)
+  Resolves: RHEL-145391
 
-* Tue Feb 03 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-11.4
-- CVE-2026-1709: Registrar authentication bypass
-  Resolves: RHEL-145390
+* Wed Feb 04 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-14
+- Add support for TPM quotes using ECC keys
+  Resolves: RHEL-118150
 
-* Fri Dec 12 2025 Sergio Correia <scorreia@redhat.com> - 7.12.1-11.3
-- Registrar allows identity takeover via duplicate UUID registration
-  Resolves: RHEL-130760
+* Tue Feb 03 2026 Sergio Correia <scorreia@redhat.com> - 7.12.1-13
+- Keylime: Registrar allows identity takeover via duplicate UUID registration
+  Resolves: RHEL-130761
+
+* Mon Feb 02 2026 Sergio Correia <scorreia@redhat.com> - 7.12.1-12
+- Change ownership of /usr/share/keylime/tpm_cert_store to root
+  Resolves: RHEL-106024
 
 * Mon Sep 15 2025 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-11.2
 - Properly fix the malformed certificate workaround

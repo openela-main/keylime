@@ -1,0 +1,87 @@
+From eecd2f73642f784b19cb1bb9c78c6d0b1e486dda Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Fri, 26 Sep 2025 00:03:49 +0100
+Subject: [PATCH 14/18] algorithms: add support for specific RSA algorithms
+
+Similar to the previous change for ECC, now we extend the Encrypt enum
+to support the following specific RSA algorithms:
+- RSA1024
+- RSA2048
+- RSA3072
+- RSA4096
+
+Map also 'rsa' to 'rsa2048' for backwards compatibility.
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ keylime/common/algorithms.py |  8 ++++++++
+ test/test_algorithms.py      | 13 ++++++++++++-
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/keylime/common/algorithms.py b/keylime/common/algorithms.py
+index bb22fb6..32a1ec1 100644
+--- a/keylime/common/algorithms.py
++++ b/keylime/common/algorithms.py
+@@ -84,6 +84,10 @@ class Hash(str, enum.Enum):
+ 
+ class Encrypt(str, enum.Enum):
+     RSA = "rsa"
++    RSA1024 = "rsa1024"
++    RSA2048 = "rsa2048"
++    RSA3072 = "rsa3072"
++    RSA4096 = "rsa4096"
+     ECC = "ecc"
+     ECC192 = "ecc192"
+     ECC224 = "ecc224"
+@@ -96,6 +100,8 @@ class Encrypt(str, enum.Enum):
+         # Handle aliases to match agent behavior
+         if algorithm == "ecc":
+             algorithm = "ecc256"  # Default ECC alias maps to P-256, same as the agent.
++        if algorithm == "rsa":
++            algorithm = "rsa2048"  # Default RSA alias maps to RSA-2048, same as the agent.
+         return algorithm in list(Encrypt)
+ 
+     @staticmethod
+@@ -103,6 +109,8 @@ class Encrypt(str, enum.Enum):
+         """Normalize algorithm string to handle aliases, matching the agent behavior"""
+         if algorithm == "ecc":
+             return "ecc256"  # Default ECC alias maps to P-256.
++        if algorithm == "rsa":
++            return "rsa2048"  # Default RSA alias maps to RSA-2048.
+         return algorithm
+ 
+ 
+diff --git a/test/test_algorithms.py b/test/test_algorithms.py
+index 8a31fa9..5542c0f 100644
+--- a/test/test_algorithms.py
++++ b/test/test_algorithms.py
+@@ -181,7 +181,7 @@ class TestEncrypt(unittest.TestCase):
+             },
+             {
+                 "input": "rsa",
+-                "expected": "rsa",
++                "expected": "rsa2048",
+             },
+         ]
+ 
+@@ -199,6 +199,17 @@ class TestEncrypt(unittest.TestCase):
+         # Test that direct ecc256 works
+         self.assertTrue(Encrypt.is_recognized("ecc256"))
+ 
++    def test_normalize_rsa_alias_behavior(self):
++        """Test that RSA alias normalization matches agent behavior"""
++        # Test that "rsa" is recognized through alias handling
++        self.assertTrue(Encrypt.is_recognized("rsa"))
++
++        # Test that normalize converts "rsa" to "rsa2048"
++        self.assertEqual(Encrypt.normalize("rsa"), "rsa2048")
++
++        # Test that direct rsa2048 works
++        self.assertTrue(Encrypt.is_recognized("rsa2048"))
++
+ 
+ class TestSign(unittest.TestCase):
+     def test_is_recognized(self):
+-- 
+2.47.3
+

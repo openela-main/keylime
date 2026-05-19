@@ -1,0 +1,43 @@
+From 690a2059be01993f5e7f65a01d994e53b82211e4 Mon Sep 17 00:00:00 2001
+From: Thore Sommer <mail@thson.de>
+Date: Mon, 3 Mar 2025 15:44:37 +0100
+Subject: [PATCH 15/18] tpm_util: fix quote signature extraction for ECDSA
+
+Signed-off-by: Thore Sommer <mail@thson.de>
+---
+ keylime/tpm/tpm_util.py | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/keylime/tpm/tpm_util.py b/keylime/tpm/tpm_util.py
+index cdecd32..25c40e0 100644
+--- a/keylime/tpm/tpm_util.py
++++ b/keylime/tpm/tpm_util.py
+@@ -223,9 +223,7 @@ def checkquote(
+     pcrblob: The state of the PCRs that were quoted; Intel tpm2-tools specific format
+     exp_hash_alg: The hash that was expected to have been used for quoting
+     """
+-    sig_alg, hash_alg, sig_size = struct.unpack_from(">HHH", sigblob, 0)
+-
+-    (signature,) = struct.unpack_from(f"{sig_size}s", sigblob, 6)
++    sig_alg, hash_alg = struct.unpack_from(">HH", sigblob, 0)
+ 
+     pubkey = serialization.load_pem_public_key(aikblob, backend=backends.default_backend())
+     if not isinstance(pubkey, (RSAPublicKey, EllipticCurvePublicKey)):
+@@ -236,6 +234,14 @@ def checkquote(
+     if isinstance(pubkey, EllipticCurvePublicKey) and sig_alg not in [tpm2_objects.TPM_ALG_ECDSA]:
+         raise ValueError(f"Unsupported quote signature algorithm '{sig_alg:#x}' for EC keys")
+ 
++    if sig_alg in [tpm2_objects.TPM_ALG_RSASSA]:
++        (sig_size,) = struct.unpack_from(">H", sigblob, 4)
++        (signature,) = struct.unpack_from(f"{sig_size}s", sigblob, 6)
++    elif sig_alg in [tpm2_objects.TPM_ALG_ECDSA]:
++        signature = ecdsa_der_from_tpm(sigblob)
++    else:
++        raise ValueError(f"Unsupported quote signature algorithm '{sig_alg:#x}'")
++
+     hashfunc = tpm2_objects.HASH_FUNCS.get(hash_alg)
+     if not hashfunc:
+         raise ValueError(f"Unsupported hash with id {hash_alg:#x} in signature blob")
+-- 
+2.47.3
+
