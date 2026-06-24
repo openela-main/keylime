@@ -1,0 +1,97 @@
+From 5e1ac3f4d70e55cd72673ead3dcf88259798c33a Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Mon, 20 Apr 2026 15:32:50 +0200
+Subject: [PATCH] verifier: Fix hardcoded attestation challenge nonce
+ (CVE-2026-6420)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Restore random nonce generation in
+CertificationParameters.generate_challenge(), which was replaced with a
+hardcoded constant, removing replay protection from push-mode TPM quote
+attestation.
+
+Remove misleading "pylint: disable=unused-argument" annotation from
+EvidenceItem.generate_challenge() — the bit_length parameter is actively
+used. The incorrect suppression and "reserved for future use" comment
+may have masked the hardcoded nonce during review.
+
+Add regression tests verifying challenge length and uniqueness.
+
+For more information, see the advisory at:
+https://github.com/keylime/keylime/security/advisories/GHSA-q8w6-w55c-ccv5
+
+Backport of: https://github.com/keylime/keylime/commit/5e1ac3f4d70e55cd72673ead3dcf88259798c33a
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/models/verifier/evidence.py |  5 ++---
+ test/test_evidence_model.py         | 30 +++++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/keylime/models/verifier/evidence.py b/keylime/models/verifier/evidence.py
+index 833a3310d..f4c765e13 100644
+--- a/keylime/models/verifier/evidence.py
++++ b/keylime/models/verifier/evidence.py
+@@ -74,7 +74,7 @@ def validate_parameters(self):
+         self.chosen_parameters.validate_choices(check_against=self.capabilities)
+         self.refresh_metadata()
+
+-    def generate_challenge(self, bit_length):  # pylint: disable=unused-argument  # Parameter reserved for future use
++    def generate_challenge(self, bit_length):
+         if self.evidence_class != "certification":  # pylint: disable=comparison-with-callable  # ORM framework pattern
+             raise ValueError("challenge can only be generated for EvidenceItem with evidence_class 'certification'")
+
+@@ -382,8 +382,7 @@ def validate_choices(self, check_against):
+         # fields can vary by evidence_type (even when the evidence_types belong to the same evidence_class)
+
+     def generate_challenge(self, bit_length):
+-        # self.challenge = Nonce.generate(bit_length)
+-        self.challenge = bytes.fromhex("49beed365aac777dae23564f5ad0ec")
++        self.challenge = Nonce.generate(bit_length)
+
+     def render(self, only=None):
+         output = super().render(only)
+diff --git a/test/test_evidence_model.py b/test/test_evidence_model.py
+index 88188c8c1..1c4b4337b 100644
+--- a/test/test_evidence_model.py
++++ b/test/test_evidence_model.py
+@@ -170,6 +170,36 @@ def test_generate_challenge_certification(self):
+
+             self.assertIsNotNone(evidence.chosen_parameters)
+
++    def test_generate_challenge_certification_length(self):
++        """Test that generate_challenge produces a challenge of the correct length"""
++        evidence = EvidenceItem.empty()
++        evidence.evidence_class = "certification"
++
++        with patch.object(evidence, "refresh_metadata"):
++            evidence.generate_challenge(128)
++
++            self.assertIsNotNone(evidence.chosen_parameters)
++            self.assertIsNotNone(evidence.chosen_parameters.challenge)
++            self.assertEqual(len(evidence.chosen_parameters.challenge), 16)  # 128 bits = 16 bytes
++
++    def test_generate_challenge_is_random(self):
++        """Test that generate_challenge produces unique random nonces"""
++        evidence1 = EvidenceItem.empty()
++        evidence1.evidence_class = "certification"
++        evidence2 = EvidenceItem.empty()
++        evidence2.evidence_class = "certification"
++
++        with patch.object(evidence1, "refresh_metadata"), \
++             patch.object(evidence2, "refresh_metadata"):
++            evidence1.generate_challenge(128)
++            evidence2.generate_challenge(128)
++
++            self.assertNotEqual(
++                evidence1.chosen_parameters.challenge,
++                evidence2.chosen_parameters.challenge,
++                "Two separately generated challenges must not be identical",
++            )
++
+     def test_generate_challenge_non_certification_raises(self):
+         """Test that generating challenge for non-certification raises ValueError"""
+         evidence = EvidenceItem.empty()
+--
+2.49.0
