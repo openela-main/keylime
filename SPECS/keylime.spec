@@ -9,7 +9,7 @@
 
 Name:    keylime
 Version: 7.12.1
-Release: 15%{?dist}
+Release: 15%{?dist}.1
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -63,6 +63,12 @@ Patch: 0021-tpm-fix-ECC-signature-parsing-to-support-variable-le.patch
 # CVE-2026-1709
 # Fix registrar authentication bypass
 Patch: 0022-CVE-2026-1709.patch
+
+# Tenant version negotiation.
+# Backport from:
+# - https://github.com/keylime/keylime/pull/1838
+# - https://github.com/keylime/keylime/pull/1845
+Patch: 0023-Backport-tenant-version-negotiation-mechanism.patch
 
 License: ASL 2.0 and MIT
 
@@ -458,6 +464,10 @@ fi
 %license LICENSE
 
 %changelog
+* Fri Jul 10 2026 Sergio Correia <scorreia@redhat.com> - 7.12.1-15.1
+- Add API version negotiation to keylime_tenant
+  Resolves: RHEL-154785
+
 * Fri Feb 13 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-15
 - Fix registrar authentication bypass (CVE-2026-1709)
   Resolves: RHEL-145391
