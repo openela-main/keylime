@@ -1,7 +1,7 @@
-From c60460eccab93863dbd1fd0b748e5a275c8e6737 Mon Sep 17 00:00:00 2001
+From 1f73ef67a77d7355df524b6c120d6247f8f40e7f Mon Sep 17 00:00:00 2001
 From: Sergio Correia <scorreia@redhat.com>
-Date: Tue, 3 Jun 2025 21:29:15 +0100
-Subject: [PATCH 5/6] Restore RHEL-9 version of create_allowlist.sh
+Date: Mon, 1 Jun 2026 13:56:43 +0100
+Subject: [PATCH 2/4] Restore RHEL-9 version of create_allowlist.sh
 
 Signed-off-by: Sergio Correia <scorreia@redhat.com>
 ---
@@ -9,7 +9,7 @@ Signed-off-by: Sergio Correia <scorreia@redhat.com>
  1 file changed, 104 insertions(+), 231 deletions(-)
 
 diff --git a/scripts/create_runtime_policy.sh b/scripts/create_runtime_policy.sh
-index 90ba50b..c0b641d 100755
+index 462073a..c0b641d 100755
 --- a/scripts/create_runtime_policy.sh
 +++ b/scripts/create_runtime_policy.sh
 @@ -1,282 +1,155 @@
@@ -303,7 +303,7 @@ index 90ba50b..c0b641d 100755
 -        # If we are on an ostree system change where we look for initramfs image
 -        loc=$(grep -E "/ostree/[^/]([^/]*)" -o /proc/cmdline | head -n 1 | cut -d / -f 3)
 -        INITRAMFS_LOC="/boot/ostree/${loc}/"
--        announce "--- The location of initramfs was overriden from \"${X}\" to \"$INITRAMFS_LOC\""
+-        announce "--- The location of initramfs was overridden from \"${X}\" to \"$INITRAMFS_LOC\""
 -    fi
 -
 -    announce "--- Creating allowlist for init ram disks found under \"$INITRAMFS_LOC\" to $ALLOWLIST_DIR/${OUTPUT} ..."
@@ -400,5 +400,5 @@ index 90ba50b..c0b641d 100755
 +# Clean up
 +rm -rf /tmp/ima
 -- 
-2.47.1
+2.54.0
 

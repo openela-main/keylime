@@ -1,0 +1,192 @@
+From ea7db68f2fd12737d156a28cfc088e244ac14489 Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Mon, 6 Jul 2026 08:23:50 +0000
+Subject: [PATCH 4/4] Disable push model (agent-driven attestation) for RHEL 9
+
+Push mode is not yet supported in this build. Gate it off at entry
+points: remove API v3.0 from supported versions, hardcode verifier
+operating mode to pull, remove --push-model tenant CLI flag. Push
+code remains in tree as dead code for easy re-enablement later.
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ keylime/api_version.py          |  4 ++--
+ keylime/cmd/verifier.py         | 11 +++++------
+ keylime/tenant.py               | 23 +----------------------
+ keylime/web/verifier_server.py  |  2 +-
+ test/test_registrar_server.py   | 31 -------------------------------
+ test/test_version_controller.py |  6 +++---
+ 6 files changed, 12 insertions(+), 65 deletions(-)
+
+diff --git a/keylime/api_version.py b/keylime/api_version.py
+index df65736..5773be7 100644
+--- a/keylime/api_version.py
++++ b/keylime/api_version.py
+@@ -7,8 +7,8 @@ from packaging import version
+ VersionType = Union[int, float, str]
+ 
+ CURRENT_VERSION: str = "2.6"
+-VERSIONS: List[str] = ["1.0", "2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "3.0"]
+-LATEST_VERSIONS: Dict[str, str] = {"1": "1.0", "2": "2.6", "3": "3.0"}
++VERSIONS: List[str] = ["1.0", "2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6"]
++LATEST_VERSIONS: Dict[str, str] = {"1": "1.0", "2": "2.6"}
+ DEPRECATED_VERSIONS: List[str] = ["1.0"]
+ 
+ 
+diff --git a/keylime/cmd/verifier.py b/keylime/cmd/verifier.py
+index 1e6cc44..8f2730d 100644
+--- a/keylime/cmd/verifier.py
++++ b/keylime/cmd/verifier.py
+@@ -10,14 +10,13 @@ logger = keylime_logging.init_logging("verifier")
+ 
+ def _log_startup_info() -> None:
+     mode = config.get("verifier", "mode", fallback="pull")
+-    logger.info("Starting Keylime verifier in %s mode...", mode.upper())
+-
+-    # Temporary warning when enabling push mode
+     if mode == "push":
+-        logger.warning(
+-            "Push mode is experimental. Please report issues at "
+-            "https://github.com/keylime/keylime/issues/?q=label:push-mode"
++        logger.error(
++            "Push mode (agent-driven attestation) is not supported in this build. "
++            "Falling back to pull mode."
+         )
++        mode = "pull"
++    logger.info("Starting Keylime verifier in %s mode...", mode.upper())
+ 
+     # Log REST API versions supported by the verifier
+     api_version.log_api_versions(logger)
+diff --git a/keylime/tenant.py b/keylime/tenant.py
+index 4cb3698..b905b4e 100644
+--- a/keylime/tenant.py
++++ b/keylime/tenant.py
+@@ -337,15 +337,7 @@ class Tenant:
+             if self.agent_port is None and self.registrar_data["port"] is not None:
+                 self.agent_port = self.registrar_data["port"]
+ 
+-        # Set push_model based on explicit --push-model flag
+-        # Default to PULL mode (False) if flag not provided
+-        if not args.get("push_model", False):
+-            self.push_model = False
+-        else:
+-            self.push_model = True
+-
+-        # If ip/port are still None, that's okay for push-mode (verifier will handle it)
+-        # The verifier's mode config determines whether ip/port are required
++        self.push_model = False
+ 
+         # Initialize ID strings early (will be updated after API detection with full info)
+         self.agent_fid_str = f"Agent {self.agent_uuid}"
+@@ -1751,13 +1743,6 @@ def main() -> None:
+         "addmbpolicy,showmbpolicy,deletembpolicy,updatembpolicy,"
+         "listmbpolicy. defaults to add",
+     )
+-    parser.add_argument(
+-        "--push-model",
+-        action="store_true",
+-        dest="push_model",
+-        default=False,
+-        help="Enable push model (avoid requests to keylime-agent)",
+-    )
+     parser.add_argument(
+         "-t", "--targethost", action="store", dest="agent_ip", help="the IP address of the host to provision"
+     )
+@@ -1983,12 +1968,6 @@ def main() -> None:
+     config.check_version("tenant", logger=logger)
+ 
+     mytenant = Tenant()
+-    # Set push_model based on explicit --push-model flag
+-    # This must be done before dispatching to commands (status, add, etc.)
+-    if hasattr(args, "push_model") and args.push_model:
+-        mytenant.push_model = True
+-    else:
+-        mytenant.push_model = False
+ 
+     if args.agent_uuid is not None:
+         mytenant.agent_uuid = args.agent_uuid
+diff --git a/keylime/web/verifier_server.py b/keylime/web/verifier_server.py
+index 11e2e5c..8d42a61 100755
+--- a/keylime/web/verifier_server.py
++++ b/keylime/web/verifier_server.py
+@@ -183,7 +183,7 @@ class VerifierServer(Server):
+     def _setup(self) -> None:
+         self._set_component("verifier")
+         self._use_config("verifier")
+-        self._set_operating_mode(from_config="mode", fallback="pull")
++        self._set_operating_mode(value="pull")
+         self._set_bind_interface(from_config="ip")
+         self._set_http_port(value=None)  # verifier does not accept insecure connections
+         self._set_https_port(from_config="port")
+diff --git a/test/test_registrar_server.py b/test/test_registrar_server.py
+index 17ee926..618f4d4 100644
+--- a/test/test_registrar_server.py
++++ b/test/test_registrar_server.py
+@@ -123,25 +123,6 @@ class TestRegistrarServerV3Routes(unittest.TestCase):
+         self.assertFalse(route.requires_auth)
+         self.assertEqual(route.auth_action, Action.ACTIVATE_AGENT)
+ 
+-    def test_v3_0_routes_also_match(self):
+-        """Test that all v3 routes also match with the /v3.0/ prefix."""
+-        cases = [
+-            ("get", "/v3.0/", VersionController, "show_version_root"),
+-            ("get", "/v3.0/agents", AgentsController, "index"),
+-            ("get", "/v3.0/agents/test-agent-id", AgentsController, "show"),
+-            ("delete", "/v3.0/agents/test-agent-id", AgentsController, "delete"),
+-            ("post", "/v3.0/agents", AgentsController, "create"),
+-            ("post", "/v3.0/agents/test-agent-id/activate", AgentsController, "activate"),
+-        ]
+-        for method, path, expected_controller, expected_action in cases:
+-            with self.subTest(method=method, path=path):
+-                route = self.server.first_matching_route(method, path)
+-                self.assertIsNotNone(route, f"No route found for {method.upper()} {path}")
+-                assert route is not None
+-                self.assertEqual(route.controller, expected_controller)
+-                self.assertEqual(route.action, expected_action)
+-
+-
+ class TestRegistrarServerV3NoCompatRoutes(unittest.TestCase):
+     """Test that v3 does NOT include the backwards-compatibility routes from v2.
+ 
+@@ -167,18 +148,6 @@ class TestRegistrarServerV3NoCompatRoutes(unittest.TestCase):
+         route = self.server.first_matching_route("put", "/v3/agents/some-agent-id")
+         self.assertIsNone(route)
+ 
+-    def test_v3_0_no_compat_routes(self):
+-        """Test that v3.0 prefix also has no compat routes."""
+-        cases = [
+-            ("post", "/v3.0/agents/some-agent-id"),
+-            ("put", "/v3.0/agents/some-agent-id/activate"),
+-            ("put", "/v3.0/agents/some-agent-id"),
+-        ]
+-        for method, path in cases:
+-            with self.subTest(method=method, path=path):
+-                route = self.server.first_matching_route(method, path)
+-                self.assertIsNone(route, f"Unexpected compat route found for {method.upper()} {path}")
+-
+ 
+ class TestRegistrarServerV3MethodNotAllowed(unittest.TestCase):
+     """Test that legacy methods on v3 paths produce 405, not 404.
+diff --git a/test/test_version_controller.py b/test/test_version_controller.py
+index 8a78c2a..ffdca11 100644
+--- a/test/test_version_controller.py
++++ b/test/test_version_controller.py
+@@ -34,12 +34,12 @@ class TestVersionControllerVersion(unittest.TestCase):
+         self.assertEqual(data["current_version"], keylime_api_version.current_version())
+         self.assertEqual(data["supported_versions"], keylime_api_version.all_versions())
+ 
+-    def test_version_includes_v3(self):
+-        """Test that the supported versions list includes v3.0."""
++    def test_version_does_not_include_v3(self):
++        """Test that v3.0 is not in supported versions (push model disabled)."""
+         self.controller.version()  # pylint: disable=not-callable
+ 
+         data = self.mock_respond.call_args[0][2]
+-        self.assertIn("3.0", data["supported_versions"])
++        self.assertNotIn("3.0", data["supported_versions"])
+ 
+ 
+ class TestVersionControllerShowVersionRoot(unittest.TestCase):
+-- 
+2.54.0
+

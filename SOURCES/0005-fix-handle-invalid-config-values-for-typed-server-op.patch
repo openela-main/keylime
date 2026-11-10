@@ -1,0 +1,102 @@
+From e06745c7c2a28bf0c796f516f8fdb529176d630c Mon Sep 17 00:00:00 2001
+From: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+Date: Thu, 16 Jul 2026 08:56:54 +0000
+Subject: [PATCH 5/5] fix: handle invalid config values for typed server
+ options
+
+When a typed configuration option (int, float, bool) contains an empty
+or invalid value, configparser raises ValueError instead of using the
+fallback. This causes the verifier to crash on startup when e.g.
+max_workers has an empty value after a config upgrade.
+
+Catch ValueError in _set_option for typed config reads and fall back to
+the caller-provided default with a warning. Also add a default fallback
+of 0 for max_workers (meaning use all CPUs).
+
+Fixes: keylime/keylime#1929
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Signed-off-by: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+---
+ keylime/web/base/server.py | 44 +++++++++++++++++++++++++++-----------
+ 1 file changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/keylime/web/base/server.py b/keylime/web/base/server.py
+index 9ac3a3c..eee8313 100644
+--- a/keylime/web/base/server.py
++++ b/keylime/web/base/server.py
+@@ -449,9 +449,34 @@ class Server(ABC):
+         """Sets config component (i.e., namespace) used to locate config values when setting server options."""
+         self.__config_component = component
+ 
++    _TYPED_CONFIG_GETTERS: dict[type, Callable[..., Any]] = {
++        int: config.getint,
++        float: config.getfloat,
++        bool: config.getboolean,
++    }
++
++    def _get_typed_config_value(self, config_name: str, data_type: type, fallback: Any) -> Any:
++        """Read a typed config value, falling back gracefully on ValueError."""
++        getter = self._TYPED_CONFIG_GETTERS[data_type]
++        try:
++            return getter(self.config_component, config_name, fallback=fallback)  # type: ignore
++        except ValueError:
++            if fallback is None:
++                raise
++            raw_value = config.get(self.config_component, config_name, fallback="<unknown>")  # type: ignore[arg-type]
++            logger.warning(
++                "Cannot parse '%s' as %s for option '%s' (component: %s), using fallback: %s",
++                raw_value,
++                data_type.__name__,
++                config_name,
++                self.config_component,
++                fallback,
++            )
++            return fallback
++
+     def _set_option(self, name: str, **kwargs: Any) -> None:
+         """Sets server option by name either from given value or by obtaining it from user config. If the value is
+-        falsy, uses the given fallback value instead or ``None`` if no fallback is provided. Examples::
++        ``None``, uses the given fallback value instead. Examples::
+ 
+             # Set option using provided value
+             self._set_option("bind_interface", value="0.0.0.0")
+@@ -488,22 +513,14 @@ class Server(ABC):
+             config_name = __match_val["from_config"][0]
+             data_type = __match_val["from_config"][1]
+             value = config.get(self.config_component, config_name, fallback=fallback)  # type: ignore
+-        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] is int:
+-            config_name = __match_val["from_config"][0]
+-            data_type = __match_val["from_config"][1]
+-            value = config.getint(self.config_component, config_name, fallback=fallback)  # type: ignore
+-        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] is float:
++        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] in self._TYPED_CONFIG_GETTERS:
+             config_name = __match_val["from_config"][0]
+             data_type = __match_val["from_config"][1]
+-            value = config.getfloat(self.config_component, config_name, fallback=fallback)  # type: ignore
+-        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] is bool:
+-            config_name = __match_val["from_config"][0]
+-            data_type = __match_val["from_config"][1]
+-            value = config.getboolean(self.config_component, config_name, fallback=fallback)  # type: ignore
++            value = self._get_typed_config_value(config_name, data_type, fallback)
+         else:
+             raise TypeError(f"invalid arguments given when setting option '{name}' for {self.__class__.__name__}")
+ 
+-        setattr(self, attr_name, value or fallback)
++        setattr(self, attr_name, value if value is not None else fallback)
+ 
+     def _set_operating_mode(self, **kwargs: Any) -> None:
+         """Sets operating mode of the server (push or pull)."""
+@@ -578,6 +595,9 @@ class Server(ABC):
+         if "from_config" in kwargs:
+             kwargs.update({"from_config": (kwargs["from_config"], int)})
+ 
++        if "fallback" not in kwargs:
++            kwargs.update({"fallback": 0})
++
+         self._set_option("max_workers", **kwargs)
+ 
+     def _set_ssl_ctx(self, **kwargs: Any) -> None:
+-- 
+2.54.0
+

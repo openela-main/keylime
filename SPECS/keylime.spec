@@ -1,5 +1,5 @@
 %global srcname keylime
-%global policy_version 42.1.2
+%global policy_version 44.1.0
 %global with_selinux 1
 %global selinuxtype targeted
 
@@ -8,8 +8,8 @@
 %global debug_package %{nil}
 
 Name:    keylime
-Version: 7.12.1
-Release: 15%{?dist}.1
+Version: 7.14.3
+Release: 1%{?dist}
 Summary: Open source TPM software for Bootstrapping and Maintaining Trust
 
 URL:            https://github.com/keylime/keylime
@@ -18,64 +18,28 @@ Source1:        https://github.com/RedHat-SP-Security/%{name}-selinux/archive/v%
 Source2:        %{srcname}.sysusers
 Source3:        %{srcname}.tmpfiles
 
+# Update keylime to work with python 3.9.
 Patch: 0001-Make-keylime-compatible-with-python-3.9.patch
-Patch: 0002-tests-fix-rpm-repo-tests-from-create-runtime-policy.patch
-Patch: 0003-tests-skip-measured-boot-related-tests-for-s390x-and.patch
-Patch: 0004-templates-duplicate-str_to_version-in-the-adjust-scr.patch
+
 # RHEL-9 ships a slightly modified version of create_allowlist.sh and
 # also a "default" server_key_password for the registrar and verifier.
-# DO NOT REMOVE THE FOLLOWING TWO PATCHES IN FOLLOWING RHEL-9.x REBASES.
-Patch: 0005-Restore-RHEL-9-version-of-create_allowlist.sh.patch
-Patch: 0006-Revert-default-server_key_password-for-verifier-regi.patch
-# Backported from https://github.com/keylime/keylime/pull/1782
-Patch: 0007-fix_db_connection_leaks.patch
+# We also disable push model in RHEL-9.
+# DO NOT REMOVE THE FOLLOWING THREE PATCHES IN FOLLOWING RHEL-9.x REBASES.
+Patch: 0002-Restore-RHEL-9-version-of-create_allowlist.sh.patch
+Patch: 0003-Revert-default-server_key_password-for-verifier-regi.patch
+Patch: 0004-Disable-push-model-agent-driven-attestation-for-RHEL.patch
 
-# Backported from https://github.com/keylime/keylime/pull/1791
-Patch: 0008-mb-support-EV_EFI_HANDOFF_TABLES-events-on-PCR1.patch
-Patch: 0009-mb-support-vendor_db-as-logged-by-newer-shim-version.patch
-
-# Backported from https://github.com/keylime/keylime/pull/1784
-# and https://github.com/keylime/keylime/pull/1785.
-Patch: 0010-verifier-Gracefully-shutdown-on-signal.patch
-Patch: 0011-revocations-Try-to-send-notifications-on-shutdown.patch
-Patch: 0012-requests_client-close-the-session-at-the-end-of-the-.patch
-Patch: 0013-fix-malformed-certs-workaround.patch
-
-# CVE-2025-13609
-# Backports from:
-# - https://github.com/keylime/keylime/pull/1817/commits/1024e19d
-# - https://github.com/keylime/keylime/pull/1825
-Patch: 0014-Add-shared-memory-infrastructure-for-multiprocess-co.patch
-Patch: 0015-Fix-registrar-duplicate-UUID-vulnerability.patch
-
-# Backported from:
-# - https://github.com/keylime/keylime/pull/1746
-# - https://github.com/keylime/keylime/pull/1803
-# - https://github.com/keylime/keylime/pull/1808
-# ECC attestation support.
-Patch: 0016-algorithms-add-support-for-specific-ECC-curve-algori.patch
-Patch: 0017-algorithms-add-support-for-specific-RSA-algorithms.patch
-Patch: 0018-tpm_util-fix-quote-signature-extraction-for-ECDSA.patch
-Patch: 0019-tpm-fix-ECC-P-521-coordinate-validation.patch
-Patch: 0020-tpm-fix-ECC-P-521-credential-activation-with-consist.patch
-Patch: 0021-tpm-fix-ECC-signature-parsing-to-support-variable-le.patch
-
-# CVE-2026-1709
-# Fix registrar authentication bypass
-Patch: 0022-CVE-2026-1709.patch
-
-# Tenant version negotiation.
-# Backport from:
-# - https://github.com/keylime/keylime/pull/1838
-# - https://github.com/keylime/keylime/pull/1845
-Patch: 0023-Backport-tenant-version-negotiation-mechanism.patch
+# Backport: https://github.com/keylime/keylime/pull/1930
+Patch: 0005-fix-handle-invalid-config-values-for-typed-server-op.patch
 
 License: ASL 2.0 and MIT
 
 BuildRequires: git-core
+BuildRequires: openssl
 BuildRequires: openssl-devel
 BuildRequires: python3-devel
 BuildRequires: python3-dbus
+BuildRequires: python3-gpg
 BuildRequires: python3-jinja2
 BuildRequires: python3-cryptography
 BuildRequires: python3-pyasn1
@@ -85,6 +49,7 @@ BuildRequires: python3-sqlalchemy
 BuildRequires: python3-lark-parser
 BuildRequires: python3-psutil
 BuildRequires: python3-pyyaml
+BuildRequires: python3-requests
 BuildRequires: python3-jsonschema
 BuildRequires: python3-setuptools
 BuildRequires: systemd-rpm-macros
@@ -464,9 +429,17 @@ fi
 %license LICENSE
 
 %changelog
-* Fri Jul 10 2026 Sergio Correia <scorreia@redhat.com> - 7.12.1-15.1
+* Mon Jun 01 2026 Sergio Correia <scorreia@redhat.com> - 7.14.1-1
+- Update to 7.14.2
+  Resolves: RHEL-180618
+
+* Fri May 22 2026 Sergio Correia <scorreia@redhat.com>  7.12.1-17
+- Apply limit on keylime-policy workers
+  Resolves: RHEL-114482
+
+* Fri May 22 2026 Sergio Correia <scorreia@redhat.com>  7.12.1-16
 - Add API version negotiation to keylime_tenant
-  Resolves: RHEL-154785
+  Resolves: RHEL-151705
 
 * Fri Feb 13 2026 Anderson Toshiyuki Sasaki <ansasaki@redhat.com> - 7.12.1-15
 - Fix registrar authentication bypass (CVE-2026-1709)

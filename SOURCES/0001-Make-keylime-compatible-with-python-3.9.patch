@@ -1,27 +1,41 @@
-From f7c32aec9c44a176124d982d942391ed3d50e846 Mon Sep 17 00:00:00 2001
+From 3e7d6ba40326aff631a19c35b78f2ba3543be140 Mon Sep 17 00:00:00 2001
 From: Sergio Correia <scorreia@redhat.com>
-Date: Tue, 3 Jun 2025 21:23:09 +0100
-Subject: [PATCH 1/6] Make keylime compatible with python 3.9
+Date: Mon, 6 Jul 2026 08:21:01 +0000
+Subject: [PATCH 1/4] Make keylime compatible with python 3.9
 
 Signed-off-by: Sergio Correia <scorreia@redhat.com>
 ---
- keylime/ima/types.py                        | 33 ++++----
- keylime/models/base/basic_model.py          |  4 +-
- keylime/models/base/basic_model_meta.py     |  4 +-
- keylime/models/base/field.py                |  4 +-
- keylime/models/base/persistable_model.py    |  4 +-
- keylime/models/base/type.py                 |  4 +-
- keylime/models/base/types/base64_bytes.py   |  4 +-
- keylime/models/base/types/certificate.py    | 92 +++++++++++----------
- keylime/models/base/types/dictionary.py     |  4 +-
- keylime/models/base/types/one_of.py         |  6 +-
- keylime/models/registrar/registrar_agent.py | 31 +++----
- keylime/policy/create_runtime_policy.py     |  2 +-
- keylime/registrar_client.py                 |  8 +-
- keylime/web/base/action_handler.py          |  7 +-
- keylime/web/base/controller.py              | 78 ++++++++---------
- tox.ini                                     | 10 +++
- 16 files changed, 154 insertions(+), 141 deletions(-)
+ keylime/ima/types.py                          |  33 +++---
+ keylime/models/base/associations.py           |   4 +-
+ keylime/models/base/basic_model.py            |   2 +-
+ keylime/models/base/basic_model_meta.py       |   4 +-
+ keylime/models/base/db.py                     |   4 +-
+ keylime/models/base/field.py                  |   6 +-
+ keylime/models/base/persistable_model.py      |   4 +-
+ keylime/models/base/persistable_model_meta.py |   4 +-
+ keylime/models/base/record_set.py             |   6 +-
+ keylime/models/base/type.py                   |   4 +-
+ keylime/models/base/types/binary.py           |   8 +-
+ keylime/models/base/types/certificate.py      | 106 +++++++++---------
+ keylime/models/base/types/dictionary.py       |   4 +-
+ keylime/models/base/types/list.py             |   4 +-
+ keylime/models/base/types/one_of.py           |   8 +-
+ keylime/models/base/types/timestamp.py        |   4 +-
+ keylime/models/registrar/registrar_agent.py   |  30 ++---
+ keylime/registrar_client.py                   |   7 +-
+ keylime/verification/base/engine_driver.py    |  10 +-
+ .../verification/base/verification_engine.py  |  10 +-
+ keylime/verification/tpm_engine.py            |   6 +-
+ keylime/web/base/action_handler.py            |   2 +-
+ keylime/web/base/api_messages/api_error.py    |  60 +++++-----
+ keylime/web/base/api_messages/api_links.py    |  10 +-
+ .../web/base/api_messages/api_message_body.py |  24 ++--
+ keylime/web/base/api_messages/api_resource.py |  42 +++----
+ keylime/web/base/controller.py                |  82 +++++++-------
+ keylime/web/base/route.py                     |   4 +-
+ keylime/web/base/server.py                    |  50 +++++----
+ test/test_authorization_integration.py        |   9 +-
+ 30 files changed, 277 insertions(+), 274 deletions(-)
 
 diff --git a/keylime/ima/types.py b/keylime/ima/types.py
 index 99f0aa7..a0fffdf 100644
@@ -89,23 +103,43 @@ index 99f0aa7..a0fffdf 100644
 +        "verification-keys": str,
      },
  )
+diff --git a/keylime/models/base/associations.py b/keylime/models/base/associations.py
+index 575171d..784f1c5 100644
+--- a/keylime/models/base/associations.py
++++ b/keylime/models/base/associations.py
+@@ -171,7 +171,7 @@ class EmbedsOneAssociation(EmbeddedAssociation):
+         else:
+             self._set_one(parent_record, other_record)
+ 
+-    def to_column(self, name: str | None = None) -> Optional[Column]:
++    def to_column(self, name: Union[str, None] = None) -> Optional[Column]:
+         if not name:
+             name = self.name
+ 
+@@ -217,7 +217,7 @@ class EmbedsManyAssociation(EmbeddedAssociation):
+     ) -> Union["AssociatedRecordSet", "EmbedsManyAssociation", None]:
+         return self._get_many(parent_record)
+ 
+-    def to_column(self, name: str | None = None) -> Optional[Column]:
++    def to_column(self, name: Union[str, None] = None) -> Optional[Column]:
+         if not name:
+             name = self.name
+ 
 diff --git a/keylime/models/base/basic_model.py b/keylime/models/base/basic_model.py
-index 68a126e..6f5de83 100644
+index 83876c6..a30a978 100644
 --- a/keylime/models/base/basic_model.py
 +++ b/keylime/models/base/basic_model.py
-@@ -407,7 +407,9 @@ class BasicModel(ABC, metaclass=BasicModelMeta):
+@@ -439,7 +439,7 @@ class BasicModel(ABC, metaclass=BasicModelMeta):
          if max and length > max:
              self._add_error(field, msg or f"should be at most {length} {element_type}(s)")
  
 -    def validate_number(self, field: str, *expressions: tuple[str, int | float], msg: Optional[str] = None) -> None:
-+    def validate_number(
-+        self, field: str, *expressions: tuple[str, Union[int, float]], msg: Optional[str] = None
-+    ) -> None:
++    def validate_number(self, field: str, *expressions: tuple[str, Union[int, float]], msg: Optional[str] = None) -> None:
          value = self.values.get(field)
  
          if not value:
 diff --git a/keylime/models/base/basic_model_meta.py b/keylime/models/base/basic_model_meta.py
-index 353e004..84617d4 100644
+index 42d56ab..c2bdbba 100644
 --- a/keylime/models/base/basic_model_meta.py
 +++ b/keylime/models/base/basic_model_meta.py
 @@ -1,6 +1,6 @@
@@ -116,7 +150,7 @@ index 353e004..84617d4 100644
  
  from sqlalchemy.types import TypeEngine
  
-@@ -40,7 +40,7 @@ class BasicModelMeta(ABCMeta):
+@@ -46,7 +46,7 @@ class BasicModelMeta(ABCMeta):
  
      # pylint: disable=bad-staticmethod-argument, no-value-for-parameter, using-constant-test
  
@@ -125,8 +159,30 @@ index 353e004..84617d4 100644
  
      @classmethod
      def _is_model_class(mcs, cls: type) -> bool:  # type: ignore[reportSelfClassParameterName]
+diff --git a/keylime/models/base/db.py b/keylime/models/base/db.py
+index bb218cf..57dc438 100644
+--- a/keylime/models/base/db.py
++++ b/keylime/models/base/db.py
+@@ -2,7 +2,7 @@ import os
+ from configparser import NoOptionError
+ from contextlib import contextmanager
+ from sqlite3 import Connection as SQLite3Connection
+-from typing import Any, Dict, Iterator, Optional, cast
++from typing import Any, Dict, Iterator, Optional, cast, Union
+ 
+ from sqlalchemy import create_engine, event
+ from sqlalchemy.engine import Engine
+@@ -164,7 +164,7 @@ class DBManager:
+             self._scoped_session.remove()
+ 
+     @contextmanager
+-    def session_context(self, session: Session | None = None) -> Iterator[Session]:
++    def session_context(self, session: Union[Session, None] = None) -> Iterator[Session]:
+         if session:
+             yield session
+             return
 diff --git a/keylime/models/base/field.py b/keylime/models/base/field.py
-index 7fb3dcb..d1e3bc3 100644
+index f53ec8d..dd80fc0 100644
 --- a/keylime/models/base/field.py
 +++ b/keylime/models/base/field.py
 @@ -1,6 +1,6 @@
@@ -135,9 +191,9 @@ index 7fb3dcb..d1e3bc3 100644
 -from typing import TYPE_CHECKING, Any, Optional, TypeAlias, Union
 +from typing import TYPE_CHECKING, Any, Optional, Union
  
+ from sqlalchemy import Column, or_
  from sqlalchemy.types import TypeEngine
- 
-@@ -23,7 +23,7 @@ class ModelField:
+@@ -26,7 +26,7 @@ class ModelField:
      [2] https://docs.python.org/3/library/functions.html#property
      """
  
@@ -146,25 +202,85 @@ index 7fb3dcb..d1e3bc3 100644
  
      FIELD_NAME_REGEX = re.compile(r"^[A-Za-z_]+[A-Za-z0-9_]*$")
  
+@@ -112,7 +112,7 @@ class ModelField:
+         sa_field = getattr(self.parent.db_mapping, self.name)  # type: ignore[attr-defined]
+         return sa_field.__ge__(other)
+ 
+-    def to_column(self, name: str | None = None) -> Optional[Column]:
++    def to_column(self, name: Union[str, None] = None) -> Optional[Column]:
+         if not self.persist:
+             return None
+ 
 diff --git a/keylime/models/base/persistable_model.py b/keylime/models/base/persistable_model.py
-index 18f7d0d..015d661 100644
+index 4aa596e..006d406 100644
 --- a/keylime/models/base/persistable_model.py
 +++ b/keylime/models/base/persistable_model.py
 @@ -1,4 +1,4 @@
--from typing import Any, Mapping, Optional, Sequence
-+from typing import Any, Mapping, Optional, Sequence, Union
+-from typing import Any, Optional, Sequence, TypeVar
++from typing import Any, Optional, Sequence, TypeVar, Union
  
- from keylime.models.base.basic_model import BasicModel
- from keylime.models.base.db import db_manager
-@@ -165,7 +165,7 @@ class PersistableModel(BasicModel, metaclass=PersistableModelMeta):
-         else:
-             return None
+ from sqlalchemy import asc, desc, or_
+ from sqlalchemy.sql.expression import ClauseElement
+@@ -240,7 +240,7 @@ class PersistableModel(BasicModel, metaclass=PersistableModelMeta):
+             cls._query(session, args, kwargs).delete()
  
--    def __init__(self, data: Optional[dict | object] = None, process_associations: bool = True) -> None:
-+    def __init__(self, data: Optional[Union[dict, object]] = None, process_associations: bool = True) -> None:
+     def __init__(
+-        self, data: Optional[dict | object] = None, process_associations: bool = True, memo: Optional[list] = None
++        self, data: Optional[Union[dict, object]] = None, process_associations: bool = True, memo: Optional[list] = None
+     ) -> None:
          if isinstance(data, type(self).db_mapping):
              super().__init__({}, process_associations)
-             self._init_from_mapping(data, process_associations)
+diff --git a/keylime/models/base/persistable_model_meta.py b/keylime/models/base/persistable_model_meta.py
+index fd02549..6403493 100644
+--- a/keylime/models/base/persistable_model_meta.py
++++ b/keylime/models/base/persistable_model_meta.py
+@@ -1,5 +1,5 @@
+ import re
+-from typing import Any, Optional, Pattern, TypeAlias
++from typing import Any, Optional, Pattern
+ 
+ from sqlalchemy import ForeignKeyConstraint, Integer, Table, Text
+ from sqlalchemy.dialects.mysql import LONGTEXT
+@@ -53,7 +53,7 @@ class PersistableModelMeta(BasicModelMeta):
+ 
+     # pylint: disable=using-constant-test, no-value-for-parameter, unused-private-member, unsupported-membership-test, no-else-return
+ 
+-    DeclaredFieldType: TypeAlias = BasicModelMeta.DeclaredFieldType  # type: ignore[reportIncompatibleVariableOverride, reportAssignmentType]
++    DeclaredFieldType = BasicModelMeta.DeclaredFieldType  # type: ignore[reportIncompatibleVariableOverride, reportAssignmentType]
+ 
+     TABLE_NAME_REGEX: Pattern = re.compile(r"^[A-Za-z_]+[A-Za-z0-9_]*$")
+ 
+diff --git a/keylime/models/base/record_set.py b/keylime/models/base/record_set.py
+index 55d40de..192db67 100644
+--- a/keylime/models/base/record_set.py
++++ b/keylime/models/base/record_set.py
+@@ -37,7 +37,7 @@ class RecordSet(set["BasicModel"]):
+     def __iter__(self) -> Iterator["BasicModel"]:
+         return iter(self._order)
+ 
+-    def __getitem__(self, arg: int | slice) -> "BasicModel | list[BasicModel]":
++    def __getitem__(self, arg: Union[int, slice]) -> "BasicModel | list[BasicModel]":
+         return self._order[arg]
+ 
+     def __copy__(self) -> "RecordSet":
+@@ -175,7 +175,7 @@ class RecordSetView:  # pylint: disable=protected-access  # Intentional access t
+         return new_view
+ 
+     def _filter_func(
+-        self, func: Callable[["BasicModel"], bool] | None, criteria: dict[str, Any]
++        self, func: Union[Callable[["BasicModel"], bool], None], criteria: dict[str, Any]
+     ) -> Callable[["BasicModel"], bool]:
+         if func:
+             return func
+@@ -191,7 +191,7 @@ class RecordSetView:  # pylint: disable=protected-access  # Intentional access t
+ 
+         return default_filter_func
+ 
+-    def filter(self, func: Callable[["BasicModel"], bool] | None = None, **criteria: Any) -> "RecordSetView":
++    def filter(self, func: Union[Callable[["BasicModel"], bool], None] = None, **criteria: Any) -> "RecordSetView":
+         if not self._content:
+             return self
+ 
 diff --git a/keylime/models/base/type.py b/keylime/models/base/type.py
 index 2520f72..e4d924c 100644
 --- a/keylime/models/base/type.py
@@ -187,29 +303,42 @@ index 2520f72..e4d924c 100644
  
      def __init__(self, type_engine: DeclaredTypeEngine) -> None:
          if isclass(type_engine) and issubclass(type_engine, TypeEngine):
-diff --git a/keylime/models/base/types/base64_bytes.py b/keylime/models/base/types/base64_bytes.py
-index b9b4b13..a1eeced 100644
---- a/keylime/models/base/types/base64_bytes.py
-+++ b/keylime/models/base/types/base64_bytes.py
-@@ -1,6 +1,6 @@
+diff --git a/keylime/models/base/types/binary.py b/keylime/models/base/types/binary.py
+index 5dde1d2..200eaad 100644
+--- a/keylime/models/base/types/binary.py
++++ b/keylime/models/base/types/binary.py
+@@ -1,7 +1,7 @@
  import base64
  import binascii
--from typing import Optional, TypeAlias, Union
-+from typing import Optional, Union
+ from inspect import isclass
+-from typing import Any, Optional, TypeAlias, Union
++from typing import Any, Optional, Union
  
- from sqlalchemy.types import Text
+ from sqlalchemy.types import LargeBinary, String
  
-@@ -62,7 +62,7 @@ class Base64Bytes(ModelType):
-         b64_str = Base64Bytes().cast("MIIE...")
+@@ -82,9 +82,9 @@ class Binary(ModelType):
+         quote = Binary().cast("0x03ff...")
      """
  
 -    IncomingValue: TypeAlias = Union[bytes, str, None]
 +    IncomingValue = Union[bytes, str, None]
  
-     def __init__(self) -> None:
-         super().__init__(Text)
+-    def __init__(self, persist_as: type[LargeBinary] | type[String] | LargeBinary | String = LargeBinary) -> None:
++    def __init__(self, persist_as: Union[type[LargeBinary], type[String], LargeBinary, String] = LargeBinary) -> None:
+         if not isinstance(persist_as, (LargeBinary, String)) and not issubclass(persist_as, (LargeBinary, String)):
+             raise TypeError("field of type 'Binary' must have a persist_as value of type 'LargeBinary' or 'String'")
+ 
+@@ -125,7 +125,7 @@ class Binary(ModelType):
+     def generate_error_msg(self, _value: IncomingValue) -> str:
+         return "must be valid binary"
+ 
+-    def _dump(self, value: IncomingValue) -> Optional[str | bytes]:
++    def _dump(self, value: IncomingValue) -> Optional[Union[str, bytes]]:
+         # pylint: disable=no-else-return
+ 
+         value = self.cast(value)
 diff --git a/keylime/models/base/types/certificate.py b/keylime/models/base/types/certificate.py
-index 2c27603..0f03169 100644
+index bf2d62f..9113a60 100644
 --- a/keylime/models/base/types/certificate.py
 +++ b/keylime/models/base/types/certificate.py
 @@ -1,7 +1,7 @@
@@ -221,40 +350,49 @@ index 2c27603..0f03169 100644
  
  import cryptography.x509
  from cryptography.hazmat.primitives.serialization import Encoding
-@@ -78,7 +78,7 @@ class Certificate(ModelType):
+@@ -79,7 +79,7 @@ class Certificate(ModelType):
          cert = Certificate().cast("-----BEGIN CERTIFICATE-----\nMIIE...")
      """
  
--    IncomingValue: TypeAlias = Union[cryptography.x509.Certificate, bytes, str, None]
-+    IncomingValue = Union[cryptography.x509.Certificate, bytes, str, None]
+-    IncomingValue: TypeAlias = Union[cryptography.x509.Certificate, CertificateWrapper, bytes, str, None]
++    IncomingValue = Union[cryptography.x509.Certificate, CertificateWrapper, bytes, str, None]
  
      def __init__(self) -> None:
          super().__init__(Text)
-@@ -195,18 +195,19 @@ class Certificate(ModelType):
+@@ -213,23 +213,23 @@ class Certificate(ModelType):
          """
  
          try:
 -            match self.infer_encoding(value):
+-                case "wrapped":
+-                    # For CertificateWrapper objects, check if they have original bytes (indicating re-encoding was needed)
+-                    return not value.has_original_bytes  # type: ignore[union-attr]
 -                case "decoded":
 -                    return None
+-                case "disabled":
+-                    return True
 -                case "der":
 -                    cryptography.x509.load_der_x509_certificate(value)  # type: ignore[reportArgumentType, arg-type]
 -                case "pem":
--                    cryptography.x509.load_pem_x509_certificate(value)  # type: ignore[reportArgumentType, arg-type]
+-                    cryptography.x509.load_pem_x509_certificate(value.encode("utf-8"))  # type: ignore[reportArgumentType, arg-type, union-attr]
 -                case "base64":
 -                    der_value = base64.b64decode(value, validate=True)  # type: ignore[reportArgumentType, arg-type]
 -                    cryptography.x509.load_der_x509_certificate(der_value)
 -                case _:
 -                    raise Exception
-+            encoding_inf = self.infer_encoding(value)
-+            if encoding_inf == "decoded":
++            __match_val = self.infer_encoding(value)
++            if __match_val == "wrapped":
++                # For CertificateWrapper objects, check if they have original bytes (indicating re-encoding was needed)
++                return not value.has_original_bytes  # type: ignore[union-attr]
++            elif __match_val == "decoded":
 +                return None
-+
-+            if encoding_inf == "der":
++            elif __match_val == "disabled":
++                return True
++            elif __match_val == "der":
 +                cryptography.x509.load_der_x509_certificate(value)  # type: ignore[reportArgumentType, arg-type]
-+            elif encoding_inf == "pem":
-+                cryptography.x509.load_pem_x509_certificate(value)  # type: ignore[reportArgumentType, arg-type]
-+            elif encoding_inf == "base64":
++            elif __match_val == "pem":
++                cryptography.x509.load_pem_x509_certificate(value.encode("utf-8"))  # type: ignore[reportArgumentType, arg-type, union-attr]
++            elif __match_val == "base64":
 +                der_value = base64.b64decode(value, validate=True)  # type: ignore[reportArgumentType, arg-type]
 +                cryptography.x509.load_der_x509_certificate(der_value)
 +            else:
@@ -262,13 +400,16 @@ index 2c27603..0f03169 100644
          except Exception:
              return False
  
-@@ -227,37 +228,38 @@ class Certificate(ModelType):
+@@ -250,40 +250,40 @@ class Certificate(ModelType):
          if not value:
              return None
  
 -        match self.infer_encoding(value):
+-            case "wrapped":
+-                return value  # type: ignore[return-value]
 -            case "decoded":
--                return value  # type: ignore[reportReturnType, return-value]
+-                # Wrap raw cryptography certificate without original bytes
+-                return wrap_certificate(value, None)  # type: ignore[arg-type]
 -            case "der":
 -                try:
 -                    return self._load_der_cert(value)  # type: ignore[reportArgumentType, arg-type]
@@ -297,18 +438,20 @@ index 2c27603..0f03169 100644
 -                    f"value cast to certificate is of type '{value.__class__.__name__}' but should be one of 'str', "
 -                    f"'bytes' or 'cryptography.x509.Certificate': '{str(value)}'"
 -                )
-+        encoding_inf = self.infer_encoding(value)
-+        if encoding_inf == "decoded":
-+            return value  # type: ignore[reportReturnType, return-value]
-+
-+        if encoding_inf == "der":
++        __match_val_2 = self.infer_encoding(value)
++        if __match_val_2 == "wrapped":
++            return value  # type: ignore[return-value]
++        elif __match_val_2 == "decoded":
++            # Wrap raw cryptography certificate without original bytes
++            return wrap_certificate(value, None)  # type: ignore[arg-type]
++        elif __match_val_2 == "der":
 +            try:
 +                return self._load_der_cert(value)  # type: ignore[reportArgumentType, arg-type]
 +            except PyAsn1Error as err:
 +                raise ValueError(
 +                    f"value cast to certificate appears DER encoded but cannot be deserialized as such: {value!r}"
 +                ) from err
-+        elif encoding_inf == "pem":
++        elif __match_val_2 == "pem":
 +            try:
 +                return self._load_pem_cert(value)  # type: ignore[reportArgumentType, arg-type]
 +            except PyAsn1Error as err:
@@ -316,7 +459,7 @@ index 2c27603..0f03169 100644
 +                    f"value cast to certificate appears PEM encoded but cannot be deserialized as such: "
 +                    f"'{str(value)}'"
 +                ) from err
-+        elif encoding_inf == "base64":
++        elif __match_val_2 == "base64":
 +            try:
 +                return self._load_der_cert(base64.b64decode(value, validate=True))  # type: ignore[reportArgumentType, arg-type]
 +            except (binascii.Error, PyAsn1Error) as err:
@@ -333,7 +476,7 @@ index 2c27603..0f03169 100644
      def generate_error_msg(self, _value: IncomingValue) -> str:
          return "must be a valid X.509 certificate in PEM format or otherwise encoded using Base64"
 diff --git a/keylime/models/base/types/dictionary.py b/keylime/models/base/types/dictionary.py
-index 7d9e811..d9ffec3 100644
+index dda8117..2d763e6 100644
 --- a/keylime/models/base/types/dictionary.py
 +++ b/keylime/models/base/types/dictionary.py
 @@ -1,5 +1,5 @@
@@ -352,8 +495,28 @@ index 7d9e811..d9ffec3 100644
  
      def __init__(self) -> None:
          super().__init__(Text)
+diff --git a/keylime/models/base/types/list.py b/keylime/models/base/types/list.py
+index 49da257..be9963f 100644
+--- a/keylime/models/base/types/list.py
++++ b/keylime/models/base/types/list.py
+@@ -1,5 +1,5 @@
+ import json
+-from typing import Optional, TypeAlias, Union
++from typing import Optional, Union
+ 
+ from sqlalchemy.types import Text
+ 
+@@ -50,7 +50,7 @@ class List(ModelType):
+         names = Dictionary().cast('["Jane", "John"]')
+     """
+ 
+-    IncomingValue: TypeAlias = Union[list, str, None]
++    IncomingValue = Union[list, str, None]
+ 
+     def __init__(self) -> None:
+         super().__init__(Text)
 diff --git a/keylime/models/base/types/one_of.py b/keylime/models/base/types/one_of.py
-index 479d417..faf097d 100644
+index 56f8d67..c21b00f 100644
 --- a/keylime/models/base/types/one_of.py
 +++ b/keylime/models/base/types/one_of.py
 @@ -1,6 +1,6 @@
@@ -375,13 +538,40 @@ index 479d417..faf097d 100644
  
      def __init__(self, *args: Declaration) -> None:
          # pylint: disable=super-init-not-called
+@@ -246,5 +246,5 @@ class OneOf(ModelType):
+         return self._permitted.copy()
+ 
+     @property
+-    def native_type(self) -> type | None:  # type: ignore[override]
++    def native_type(self) -> Union[type, None]:  # type: ignore[override]
+         return None
+diff --git a/keylime/models/base/types/timestamp.py b/keylime/models/base/types/timestamp.py
+index 22c1fcb..60258cb 100644
+--- a/keylime/models/base/types/timestamp.py
++++ b/keylime/models/base/types/timestamp.py
+@@ -1,5 +1,5 @@
+ from datetime import datetime, timezone
+-from typing import Optional, TypeAlias, Union
++from typing import Optional, Union
+ 
+ from sqlalchemy.types import String
+ 
+@@ -7,7 +7,7 @@ from keylime.models.base.type import ModelType
+ 
+ 
+ class Timestamp(ModelType):
+-    IncomingValue: TypeAlias = Union[datetime, str, int, float, None]
++    IncomingValue = Union[datetime, str, int, float, None]
+ 
+     @staticmethod
+     def now() -> datetime:
 diff --git a/keylime/models/registrar/registrar_agent.py b/keylime/models/registrar/registrar_agent.py
-index 560c188..b232049 100644
+index 9894f45..0fb2eb7 100644
 --- a/keylime/models/registrar/registrar_agent.py
 +++ b/keylime/models/registrar/registrar_agent.py
-@@ -153,21 +153,22 @@ class RegistrarAgent(PersistableModel):
-         names = ", ".join(non_compliant_certs)
-         names = " and".join(names.rsplit(",", 1))
+@@ -262,21 +262,21 @@ class RegistrarAgent(PersistableModel):
+         if not non_compliant_certs:
+             return
  
 -        match config.get("registrar", "malformed_cert_action"):
 -            case "ignore":
@@ -390,51 +580,37 @@ index 560c188..b232049 100644
 -                logger.error(
 -                    "Certificate(s) %s may not conform to strict ASN.1 DER encoding rules and were rejected due to "
 -                    "config ('malformed_cert_action = reject')",
--                    names,
+-                    keylime_logging.list_items(non_compliant_certs),
 -                )
 -            case _:
 -                logger.warning(
 -                    "Certificate(s) %s may not conform to strict ASN.1 DER encoding rules and were re-encoded before "
 -                    "parsing by python-cryptography",
--                    names,
+-                    keylime_logging.list_items(non_compliant_certs),
 -                )
-+        cfg = config.get("registrar", "malformed_cert_action")
-+        if cfg == "ignore":
++        __match_val = config.get("registrar", "malformed_cert_action")
++        if __match_val == "ignore":
 +            return
-+
-+        if cfg == "reject":
++        elif __match_val == "reject":
 +            logger.error(
 +                "Certificate(s) %s may not conform to strict ASN.1 DER encoding rules and were rejected due to "
 +                "config ('malformed_cert_action = reject')",
-+                names,
++                keylime_logging.list_items(non_compliant_certs),
 +            )
 +        else:
 +            logger.warning(
 +                "Certificate(s) %s may not conform to strict ASN.1 DER encoding rules and were re-encoded before "
 +                "parsing by python-cryptography",
-+                names,
++                keylime_logging.list_items(non_compliant_certs),
 +            )
  
      def _bind_ak_to_iak(self, iak_attest, iak_sign):
          # The ak-iak binding should only be verified when either aik_tpm or iak_tpm is changed
-diff --git a/keylime/policy/create_runtime_policy.py b/keylime/policy/create_runtime_policy.py
-index 6a412c4..8e1c687 100644
---- a/keylime/policy/create_runtime_policy.py
-+++ b/keylime/policy/create_runtime_policy.py
-@@ -972,7 +972,7 @@ def create_runtime_policy(args: argparse.Namespace) -> Optional[RuntimePolicyTyp
-                 )
-                 abort = True
-         else:
--            if a not in algorithms.Hash:
-+            if a not in set(algorithms.Hash):
-                 if a == SHA256_OR_SM3:
-                     algo = a
-                 else:
 diff --git a/keylime/registrar_client.py b/keylime/registrar_client.py
-index 705ff12..97fbc2a 100644
+index 8494e1d..a1ad80e 100644
 --- a/keylime/registrar_client.py
 +++ b/keylime/registrar_client.py
-@@ -13,12 +13,6 @@ if sys.version_info >= (3, 8):
+@@ -13,11 +13,6 @@ if sys.version_info >= (3, 8):
  else:
      from typing_extensions import TypedDict
  
@@ -443,11 +619,10 @@ index 705ff12..97fbc2a 100644
 -else:
 -    from typing_extensions import NotRequired
 -
--
+ 
  class RegistrarData(TypedDict):
      ip: Optional[str]
-     port: Optional[str]
-@@ -27,7 +21,7 @@ class RegistrarData(TypedDict):
+@@ -27,7 +22,7 @@ class RegistrarData(TypedDict):
      aik_tpm: str
      ek_tpm: str
      ekcert: Optional[str]
@@ -456,43 +631,483 @@ index 705ff12..97fbc2a 100644
  
  
  logger = keylime_logging.init_logging("registrar_client")
+diff --git a/keylime/verification/base/engine_driver.py b/keylime/verification/base/engine_driver.py
+index 72a570d..406fc1a 100644
+--- a/keylime/verification/base/engine_driver.py
++++ b/keylime/verification/base/engine_driver.py
+@@ -1,7 +1,7 @@
+ # pyright: reportAttributeAccessIssue=false
+ # Uses ORM models with dynamically-created attributes from metaclasses
+ import re
+-from typing import TYPE_CHECKING, Any, overload
++from typing import TYPE_CHECKING, Any, overload, Union
+ 
+ from keylime.models.base import db_manager
+ from keylime.verification.base.verification_engine import VerificationEngine
+@@ -26,7 +26,7 @@ class EngineDriver:
+         ...
+ 
+     @classmethod
+-    def register_parameter_mutator(cls, engine: VerificationEngineMeta, evidence_types: str | tuple[str, ...]) -> None:
++    def register_parameter_mutator(cls, engine: VerificationEngineMeta, evidence_types: Union[str, tuple[str, ...]]) -> None:
+         if not issubclass(engine, VerificationEngine):
+             raise TypeError("only a subclass of VerificationEngine can be registered as a parameter mutator")
+ 
+@@ -56,7 +56,7 @@ class EngineDriver:
+         ...
+ 
+     @classmethod
+-    def register_evidence_evaluator(cls, engine: VerificationEngineMeta, evidence_types: str | tuple[str, ...]) -> None:
++    def register_evidence_evaluator(cls, engine: VerificationEngineMeta, evidence_types: Union[str, tuple[str, ...]]) -> None:
+         if not issubclass(engine, VerificationEngine):
+             raise TypeError("only a subclass of VerificationEngine can be registered as a evidence evaluator")
+ 
+@@ -76,14 +76,14 @@ class EngineDriver:
+             cls._evidence_evaluators[evidence_type].append(engine)
+ 
+     @classmethod
+-    def get_parameter_mutators(cls, evidence_type: str) -> list[type[VerificationEngine]] | None:
++    def get_parameter_mutators(cls, evidence_type: str) -> Union[list[type[VerificationEngine]], None]:
+         if not isinstance(evidence_type, str):
+             raise TypeError("evidence type must be given as a string")
+ 
+         return cls._parameter_mutators.get(evidence_type)
+ 
+     @classmethod
+-    def get_evidence_evaluators(cls, evidence_type: str) -> list[type[VerificationEngine]] | None:
++    def get_evidence_evaluators(cls, evidence_type: str) -> Union[list[type[VerificationEngine]], None]:
+         if not isinstance(evidence_type, str):
+             raise TypeError("evidence type must be given as a string")
+ 
+diff --git a/keylime/verification/base/verification_engine.py b/keylime/verification/base/verification_engine.py
+index 1e81944..c763e9a 100644
+--- a/keylime/verification/base/verification_engine.py
++++ b/keylime/verification/base/verification_engine.py
+@@ -1,7 +1,7 @@
+ # pyright: reportAttributeAccessIssue=false
+ # Uses ORM models with dynamically-created attributes from metaclasses
+ from abc import ABC, abstractmethod
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Union
+ 
+ from keylime.verification.base.verification_engine_meta import VerificationEngineMeta
+ 
+@@ -39,19 +39,19 @@ class VerificationEngine(ABC, metaclass=VerificationEngineMeta):
+         return self.attestation.stage  # type: ignore[no-any-return]
+ 
+     @property
+-    def evaluation(self) -> str | None:
++    def evaluation(self) -> Union[str, None]:
+         return self.attestation.evaluation  # type: ignore[no-any-return]
+ 
+     @evaluation.setter
+-    def evaluation(self, evaluation: str | None) -> None:
++    def evaluation(self, evaluation: Union[str, None]) -> None:
+         self.attestation.evaluation = evaluation
+ 
+     @property
+-    def failure_reason(self) -> str | None:
++    def failure_reason(self) -> Union[str, None]:
+         return self.attestation.failure_reason  # type: ignore[no-any-return, attr-defined]
+ 
+     @failure_reason.setter
+-    def failure_reason(self, failure_reason: str | None) -> None:
++    def failure_reason(self, failure_reason: Union[str, None]) -> None:
+         self.attestation.failure_reason = failure_reason  # type: ignore[attr-defined]
+ 
+     @property
+diff --git a/keylime/verification/tpm_engine.py b/keylime/verification/tpm_engine.py
+index 621ffc2..3b48f59 100644
+--- a/keylime/verification/tpm_engine.py
++++ b/keylime/verification/tpm_engine.py
+@@ -3,7 +3,7 @@
+ import math
+ import time
+ from datetime import timedelta
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Union
+ 
+ from keylime import agent_util, config, keylime_logging, push_agent_monitor
+ from keylime.agentstates import AgentAttestState, TPMClockInfo
+@@ -32,7 +32,7 @@ class TPMEngine(VerificationEngine):
+ 
+     def __init__(self, attestation: "Attestation") -> None:
+         super().__init__(attestation)
+-        self._attest_state: AgentAttestState | None = None
++        self._attest_state: Union[AgentAttestState, None] = None
+ 
+     def _validate_system_info(self) -> None:
+         if not self.expects_ima_log:
+@@ -985,7 +985,7 @@ class TPMEngine(VerificationEngine):
+         return TPMEngine(self.previous_attestation)._select_ima_log_item()  # type: ignore[arg-type]
+ 
+     @property
+-    def attest_state(self) -> AgentAttestState | None:
++    def attest_state(self) -> Union[AgentAttestState, None]:
+         """The most current verification state of the attested system as understood by the verifier, returned as an
+         AgentAttestState object. This object contains the parameters which are used as input to Keylime's low-level
+         verification functions in ``keylime.tpm``. During verification, these functions update the AgentAttestState
 diff --git a/keylime/web/base/action_handler.py b/keylime/web/base/action_handler.py
-index b20de89..e7b5888 100644
+index 68dd30d..df37be0 100644
 --- a/keylime/web/base/action_handler.py
 +++ b/keylime/web/base/action_handler.py
-@@ -1,4 +1,5 @@
- import re
-+import sys
- import time
- import traceback
- from inspect import iscoroutinefunction
-@@ -48,7 +49,11 @@ class ActionHandler(RequestHandler):
+@@ -59,7 +59,7 @@ class ActionHandler(RequestHandler):
+         logger.error("An uncaught exception occurred while handling a request:")
  
-         # Take the list of strings returned by format_exception, where each string ends in a newline and may contain
-         # internal newlines, and split the concatenation of all the strings by newline
--        message = "".join(traceback.format_exception(err))
-+        if sys.version_info < (3, 10):
-+            message = "".join(traceback.format_exception(err, None, None))
+         try:
+-            formatted_tb = traceback.format_exception(err)
++            formatted_tb = traceback.format_exception(type(err), err, err.__traceback__)
+         except NameError:
+             # Sometimes an exception cannot be printed with traceback.format_exception() for unknown reasons.
+             # If this occurs, manually construct the output using traceback.format_tb()
+diff --git a/keylime/web/base/api_messages/api_error.py b/keylime/web/base/api_messages/api_error.py
+index f751f6a..226986b 100644
+--- a/keylime/web/base/api_messages/api_error.py
++++ b/keylime/web/base/api_messages/api_error.py
+@@ -1,5 +1,5 @@
+ from types import MappingProxyType
+-from typing import TYPE_CHECKING, Any, overload
++from typing import TYPE_CHECKING, Any, overload, Union
+ 
+ import keylime.web.base.api_messages as api_messages  # pylint: disable=consider-using-from-import  # Avoid circular import
+ from keylime.web.base.api_messages.api_links import APILink, APILinksMixin
+@@ -34,26 +34,30 @@ class APIError(APILinksMixin):
+         if not APIMessageHelpers.is_valid_name(args[0]):
+             raise InvalidMember("the given error code (i.e., 'api_code') is not a valid JSON:API member name")
+ 
+-        self._api_code: str | None = None
+-        self._http_code: int | None = None
+-        self._detail: str | None = None
+-        self._source: dict[str, str] | None = None
++        self._api_code: Union[str, None] = None
++        self._http_code: Union[int, None] = None
++        self._detail: Union[str, None] = None
++        self._source: Union[dict[str, str], None] = None
+         self._links: dict[str, APILink] = {}
+ 
+         self.set_api_code(args[0])
+ 
+-        match args[1:]:
+-            case ():
+-                pass
+-            case (http_code,) if isinstance(http_code, int):
+-                self.set_http_code(http_code)
+-            case (detail,) if isinstance(detail, str):
+-                self.set_detail(detail)
+-            case (http_code, detail):
+-                self.set_http_code(http_code)
+-                self.set_detail(detail)
+-            case _:
+-                raise TypeError(f"{self.__class__}() received invalid positional arguments")
++        __match_val = args[1:]
++        if isinstance(__match_val, (list, tuple)) and len(__match_val) == 0:
++            pass
++        elif (isinstance(__match_val, (list, tuple)) and len(__match_val) == 1) and isinstance(__match_val[0], int):
++            http_code = __match_val[0]
++            self.set_http_code(http_code)
++        elif (isinstance(__match_val, (list, tuple)) and len(__match_val) == 1) and isinstance(__match_val[0], str):
++            detail = __match_val[0]
++            self.set_detail(detail)
++        elif isinstance(__match_val, (list, tuple)) and len(__match_val) == 2:
++            http_code = __match_val[0]
++            detail = __match_val[1]
++            self.set_http_code(http_code)
++            self.set_detail(detail)
 +        else:
-+            message = "".join(traceback.format_exception(err))
-+
-         lines = message.split("\n")
++            raise TypeError(f"{self.__class__}() received invalid positional arguments")
  
-         for line in lines:
+         # JSON:API features not currently implemented:
+         #   - "id" member
+@@ -107,12 +111,12 @@ class APIError(APILinksMixin):
+         return self
+ 
+     def set_source(self, **kwargs: str) -> "APIError":
+-        match kwargs:
+-            case {"pointer": _} | {"parameter": _} | {"header": _}:
+-                self._source = kwargs
+-                return self
+-            case _:
+-                raise TypeError(f"{self.__class__}.set_source() received invalid keyword arguments")
++        __match_val_2 = kwargs
++        if isinstance(__match_val_2, dict) and "pointer" in __match_val_2 or isinstance(__match_val_2, dict) and "parameter" in __match_val_2 or isinstance(__match_val_2, dict) and "header" in __match_val_2:
++            self._source = kwargs
++            return self
++        else:
++            raise TypeError(f"{self.__class__}.set_source() received invalid keyword arguments")
+ 
+     def clear_source(self) -> "APIError":
+         self._source = None
+@@ -147,22 +151,22 @@ class APIError(APILinksMixin):
+         return output
+ 
+     def send_via(
+-        self, controller: "Controller", *, code: int | None = None, status: str | None = None, stop_action: bool = True
++        self, controller: "Controller", *, code: Union[int, None] = None, status: Union[str, None] = None, stop_action: bool = True
+     ) -> None:
+         api_messages.APIMessageBody(self).send_via(controller, code=code, status=status, stop_action=stop_action)
+ 
+     @property
+-    def api_code(self) -> str | None:
++    def api_code(self) -> Union[str, None]:
+         return self._api_code
+ 
+     @property
+-    def http_code(self) -> int | None:
++    def http_code(self) -> Union[int, None]:
+         return self._http_code
+ 
+     @property
+-    def detail(self) -> str | None:
++    def detail(self) -> Union[str, None]:
+         return self._detail
+ 
+     @property
+-    def source(self) -> MappingProxyType[str, str] | None:
++    def source(self) -> Union[MappingProxyType[str, str], None]:
+         return MappingProxyType(self._source) if self._source else None
+diff --git a/keylime/web/base/api_messages/api_links.py b/keylime/web/base/api_messages/api_links.py
+index 7582bf0..c07d1cd 100644
+--- a/keylime/web/base/api_messages/api_links.py
++++ b/keylime/web/base/api_messages/api_links.py
+@@ -1,6 +1,6 @@
+ from collections.abc import Mapping
+ from types import MappingProxyType
+-from typing import Any
++from typing import Any, Union
+ 
+ from keylime.web.base.api_messages.api_message_helpers import APIMessageHelpers
+ from keylime.web.base.exceptions import InvalidMember
+@@ -16,7 +16,7 @@ class APILink:
+             raise InvalidMember("link name is not a valid JSON:API member name")
+ 
+         self._name = name
+-        self._href: str | None = None
++        self._href: Union[str, None] = None
+ 
+         self.set_href(href)
+ 
+@@ -38,7 +38,7 @@ class APILink:
+         self._href = href
+         return self
+ 
+-    def render(self) -> str | None:
++    def render(self) -> Union[str, None]:
+         return self.href
+ 
+     @property
+@@ -46,7 +46,7 @@ class APILink:
+         return self._name
+ 
+     @property
+-    def href(self) -> str | None:
++    def href(self) -> Union[str, None]:
+         return self._href
+ 
+ 
+@@ -84,7 +84,7 @@ class APILinksMixin:
+         self._links.clear()
+         return self
+ 
+-    def render_links(self) -> dict[str, str | None]:
++    def render_links(self) -> dict[str, Union[str, None]]:
+         return {name: link.render() for name, link in self.links.items()}
+ 
+     @property
+diff --git a/keylime/web/base/api_messages/api_message_body.py b/keylime/web/base/api_messages/api_message_body.py
+index 5ef45ba..c30b084 100644
+--- a/keylime/web/base/api_messages/api_message_body.py
++++ b/keylime/web/base/api_messages/api_message_body.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ from collections.abc import Mapping, Sequence
+ from types import MappingProxyType
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Union
+ 
+ from keylime import keylime_logging
+ from keylime.models.base import BasicModel
+@@ -51,11 +51,11 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+         return message_body
+ 
+     @classmethod
+-    def from_record_errors(cls, records: BasicModel | Sequence[BasicModel]) -> "APIMessageBody":
++    def from_record_errors(cls, records: Union[BasicModel, Sequence[BasicModel]]) -> "APIMessageBody":
+         return cls().add_record_errors(records)
+ 
+-    def __init__(self, *items: base.APIResource | APIError | APIMeta | APILink):
+-        self._data: base.APIResource | list[base.APIResource] | None = None
++    def __init__(self, *items: Union[base.APIResource, APIError, APIMeta, APILink]):
++        self._data: Union[base.APIResource, list[base.APIResource], None] = None
+         self._errors: list[APIError] = []
+         self._meta: dict[str, APIMeta] = {}
+         self._links: dict[str, APILink] = {}
+@@ -91,7 +91,7 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+         self._data.append(resource)
+         return self
+ 
+-    def load_resources(self, data: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -> "APIMessageBody":
++    def load_resources(self, data: Union[Mapping[str, Any], Sequence[Mapping[str, Any]]]) -> "APIMessageBody":
+         if not isinstance(data, (Mapping, Sequence)):
+             raise InvalidMember("the JSON:API 'data' member must be a mapping or sequence")
+ 
+@@ -148,7 +148,7 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+ 
+         return self
+ 
+-    def add_record_errors(self, records: BasicModel | Sequence[BasicModel]) -> "APIMessageBody":
++    def add_record_errors(self, records: Union[BasicModel, Sequence[BasicModel]]) -> "APIMessageBody":
+         errors: dict[str, list[str]] = {}
+         single_resource = False
+ 
+@@ -193,10 +193,10 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+         self._errors.clear()
+         return self
+ 
+-    def get_errors(self, code: str | int) -> list[APIError]:
++    def get_errors(self, code: Union[str, int]) -> list[APIError]:
+         return [error for error in self.errors if code in (error.api_code, error.http_code)]
+ 
+-    def include(self, *items: base.APIResource | APIError | APIMeta | APILink) -> "APIMessageBody":
++    def include(self, *items: Union[base.APIResource, APIError, APIMeta, APILink]) -> "APIMessageBody":
+         for item in items:
+             if isinstance(item, base.APIResource):
+                 self.add_resource(item)
+@@ -242,7 +242,7 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+ 
+         return output
+ 
+-    def _get_current_path(self) -> str | None:
++    def _get_current_path(self) -> Union[str, None]:
+         current_location = self.links.get("self")
+ 
+         if not current_location:
+@@ -250,7 +250,7 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+ 
+         return base.Route.make_abs_path(current_location.href)  # type: ignore[no-any-return, arg-type]
+ 
+-    def _get_resource_path(self) -> str | None:
++    def _get_resource_path(self) -> Union[str, None]:
+         resource_location = self.data.links.get("self") if isinstance(self.data, base.APIResource) else None
+ 
+         if not resource_location:
+@@ -302,7 +302,7 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+             logger.warning("  • %s: %s", error.api_code, error.detail)
+ 
+     def send_via(
+-        self, controller: "Controller", *, code: int | None = None, status: str | None = None, stop_action: bool = True
++        self, controller: "Controller", *, code: Union[int, None] = None, status: Union[str, None] = None, stop_action: bool = True
+     ) -> None:
+         if not isinstance(controller, base.Controller):
+             raise TypeError(
+@@ -328,7 +328,7 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
+             raise StopAction
+ 
+     @property
+-    def data(self) -> base.APIResource | list[base.APIResource] | None:
++    def data(self) -> Union[base.APIResource, list[base.APIResource], None]:
+         if isinstance(self._data, list):
+             return self._data.copy()
+         return self._data
+diff --git a/keylime/web/base/api_messages/api_resource.py b/keylime/web/base/api_messages/api_resource.py
+index efd9599..8623d0b 100644
+--- a/keylime/web/base/api_messages/api_resource.py
++++ b/keylime/web/base/api_messages/api_resource.py
+@@ -1,6 +1,6 @@
+ from collections.abc import Mapping
+ from types import MappingProxyType
+-from typing import TYPE_CHECKING, Any, overload
++from typing import TYPE_CHECKING, Any, overload, Union
+ 
+ import keylime.web.base.api_messages as api_messages  # pylint: disable=consider-using-from-import  # Avoid circular import
+ from keylime.web.base.api_messages.api_links import APILink, APILinksMixin
+@@ -58,26 +58,30 @@ class APIResource(APILinksMixin, APIMetaMixin):
+         if not args:
+             raise MissingMember("no 'type' given for a JSON:API resource")
+ 
+-        self._type: str | None = None
+-        self._id: str | None = None
++        self._type: Union[str, None] = None
++        self._id: Union[str, None] = None
+         self._attributes: dict[str, Any] = {}
+         self._links: dict[str, APILink] = {}
+         self._meta: dict[str, APIMeta] = {}
+ 
+         self.set_type(args[0])
+ 
+-        match args[1:]:
+-            case ():
+-                pass
+-            case (res_id,) if isinstance(res_id, str):
+-                self.set_id(res_id)
+-            case (attributes,) if isinstance(attributes, dict):
+-                self.load_attributes(attributes)
+-            case (res_id, attributes):
+-                self.load_attributes(attributes)
+-                self.set_id(res_id)
+-            case _:
+-                raise TypeError(f"{self.__class__}() received invalid positional arguments")
++        __match_val = args[1:]
++        if isinstance(__match_val, (list, tuple)) and len(__match_val) == 0:
++            pass
++        elif (isinstance(__match_val, (list, tuple)) and len(__match_val) == 1) and isinstance(__match_val[0], str):
++            res_id = __match_val[0]
++            self.set_id(res_id)
++        elif (isinstance(__match_val, (list, tuple)) and len(__match_val) == 1) and isinstance(__match_val[0], dict):
++            attributes = __match_val[0]
++            self.load_attributes(attributes)
++        elif isinstance(__match_val, (list, tuple)) and len(__match_val) == 2:
++            res_id = __match_val[0]
++            attributes = __match_val[1]
++            self.load_attributes(attributes)
++            self.set_id(res_id)
++        else:
++            raise TypeError(f"{self.__class__}() received invalid positional arguments")
+ 
+         # JSON:API features not currently implemented:
+         #   - "relationships" member
+@@ -143,7 +147,7 @@ class APIResource(APILinksMixin, APIMetaMixin):
+         self._attributes.clear()
+         return self
+ 
+-    def include(self, *items: APILink | APIMeta) -> "APIResource":
++    def include(self, *items: Union[APILink, APIMeta]) -> "APIResource":
+         for item in items:
+             if isinstance(item, APILink):
+                 self.add_link(item)
+@@ -172,16 +176,16 @@ class APIResource(APILinksMixin, APIMetaMixin):
+         return output
+ 
+     def send_via(
+-        self, controller: "Controller", *, code: int | None = None, status: str | None = None, stop_action: bool = True
++        self, controller: "Controller", *, code: Union[int, None] = None, status: Union[str, None] = None, stop_action: bool = True
+     ) -> None:
+         api_messages.APIMessageBody(self).send_via(controller, code=code, status=status, stop_action=stop_action)
+ 
+     @property
+-    def type(self) -> str | None:
++    def type(self) -> Union[str, None]:
+         return self._type
+ 
+     @property
+-    def id(self) -> str | None:
++    def id(self) -> Union[str, None]:
+         return self._id
+ 
+     @property
 diff --git a/keylime/web/base/controller.py b/keylime/web/base/controller.py
-index f1ac3c5..153535e 100644
+index bd30130..3ee03c3 100644
 --- a/keylime/web/base/controller.py
 +++ b/keylime/web/base/controller.py
-@@ -2,7 +2,7 @@ import http.client
- import json
+@@ -3,7 +3,7 @@ import json
  import re
+ from functools import wraps
  from types import MappingProxyType
 -from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, TypeAlias, Union
 +from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, Union
  
  from tornado.escape import parse_qs_bytes
  from tornado.httputil import parse_body_arguments
-@@ -15,14 +15,16 @@ if TYPE_CHECKING:
+@@ -20,14 +20,14 @@ if TYPE_CHECKING:
      from keylime.models.base.basic_model import BasicModel
      from keylime.web.base.action_handler import ActionHandler
  
@@ -506,19 +1121,17 @@ index f1ac3c5..153535e 100644
 -Params: TypeAlias = Mapping[str, Union[str, bytes, Sequence[str | bytes], JSONObjectConvertible, JSONArrayConvertible]]
 +PathParams = Mapping[str, str]
 +QueryParams = Mapping[str, Union[str, Sequence[str]]]
-+MultipartParams = Mapping[str, Union[str, bytes, Union[Sequence[str], Sequence[bytes]]]]
++MultipartParams = Mapping[str, Union[str, bytes, Sequence[Union[str, bytes]]]]
 +FormParams = Union[QueryParams, MultipartParams]
 +JSONConvertible = Union[str, int, float, bool, None, "JSONObjectConvertible", "JSONArrayConvertible"]
 +JSONObjectConvertible = Mapping[str, JSONConvertible]
 +JSONArrayConvertible = Sequence[JSONConvertible]  # pyright: ignore[reportInvalidTypeForm]
-+Params = Mapping[
-+    str, Union[str, bytes, Union[Sequence[str], Sequence[bytes]], JSONObjectConvertible, JSONArrayConvertible]
-+]
++Params = Mapping[str, Union[str, bytes, Sequence[Union[str, bytes]], JSONObjectConvertible, JSONArrayConvertible]]
  
  
  class Controller:
-@@ -77,7 +79,7 @@ class Controller:
-     VERSION_REGEX = re.compile("^\\/v(\\d+)(?:\\.(\\d+))*")
+@@ -123,7 +123,7 @@ class Controller:
+         return require_json_api_wrapper
  
      @staticmethod
 -    def decode_url_query(query: str | bytes) -> QueryParams:
@@ -526,7 +1139,16 @@ index f1ac3c5..153535e 100644
          """Parses a binary query string (whether from a URL or HTTP body) into a dict of Unicode strings. If multiple
          instances of the same key are present in the string, their values are collected into a list.
  
-@@ -135,8 +137,8 @@ class Controller:
+@@ -160,7 +160,7 @@ class Controller:
+         :raises: :class:`ParamDecodeError`: form data is malformed
+         """
+         collated_params: dict[str, list[bytes]] = {}
+-        decoded_params: dict[str, Union[str, bytes, Sequence[str | bytes]]] = {}
++        decoded_params: dict[str, Union[str, bytes, Sequence[Union[str, bytes]]]] = {}
+ 
+         try:
+             parse_body_arguments(content_type, form, collated_params, {})
+@@ -181,8 +181,8 @@ class Controller:
  
      @staticmethod
      def prepare_http_body(
@@ -537,13 +1159,14 @@ index f1ac3c5..153535e 100644
          """Prepares an object to be included in the body of an HTTP request or response and infers the appropriate
          media type unless provided. ``body`` will be serialised into JSON if it contains a ``dict`` or ``list`` which is
          serialisable unless a ``content_type`` other than ``"application/json"`` is provided.
-@@ -155,32 +157,34 @@ class Controller:
+@@ -201,34 +201,34 @@ class Controller:
          if content_type:
              content_type = content_type.lower().strip()
  
 -        body_out: Optional[bytes | Any]
--        content_type_out: Optional[str]
--
++        body_out: Optional[Union[bytes, Any]]
+         content_type_out: Optional[str]
+ 
 -        match (body, content_type):
 -            case (None, _):
 -                body_out = None
@@ -552,19 +1175,8 @@ index f1ac3c5..153535e 100644
 -                body_out = b""
 -                content_type_out = "text/plain; charset=utf-8"
 -            case (_, "text/plain"):
-+        body_out: Optional[bytes | Any] = None
-+        content_type_out: Optional[str] = None
-+
-+        if body is None:
-+            body_out = None
-+            content_type_out = content_type
-+        elif body == "":
-+            body_out = b""
-+            content_type_out = "text/plain; charset=utf-8"
-+        else:
-+            if content_type == "text/plain":
-                 body_out = str(body).encode("utf-8")
-                 content_type_out = "text/plain; charset=utf-8"
+-                body_out = str(body).encode("utf-8")
+-                content_type_out = "text/plain; charset=utf-8"
 -            case (_, "application/json") if isinstance(body, str):
 -                body_out = body.encode("utf-8")
 -                content_type_out = "application/json"
@@ -578,51 +1190,187 @@ index f1ac3c5..153535e 100644
 -                body_out = json.dumps(body, allow_nan=False, indent=4).encode("utf-8")
 -                content_type_out = "application/json"
 -            case (_, _):
-+            elif content_type == "application/json":
-+                if isinstance(body, str):
-+                    body_out = body.encode("utf-8")
-+                    content_type_out = "application/json"
-+                else:
-+                    body_out = json.dumps(body, allow_nan=False, indent=4).encode("utf-8")
-+                    content_type_out = "application/json"
-+            elif content_type is None:
-+                if isinstance(body, str):
-+                    body_out = body.encode("utf-8")
-+                    content_type_out = "text/plain; charset=utf-8"
-+                elif isinstance(body, (dict, list)):
-+                    body_out = json.dumps(body, allow_nan=False, indent=4).encode("utf-8")
-+                    content_type_out = "application/json"
-+            else:
-                 body_out = body
-                 content_type_out = content_type
+-                body_out = body
+-                content_type_out = content_type
++        __match_val = (body, content_type)
++        if isinstance(__match_val, (list, tuple)) and len(__match_val) == 2 and __match_val[0] is None:
++            body_out = None
++            content_type_out = content_type
++        elif isinstance(__match_val, (list, tuple)) and len(__match_val) == 2 and __match_val[0] == "":
++            body_out = b""
++            content_type_out = "text/plain; charset=utf-8"
++        elif isinstance(__match_val, (list, tuple)) and len(__match_val) == 2 and __match_val[1] == "text/plain":
++            body_out = str(body).encode("utf-8")
++            content_type_out = "text/plain; charset=utf-8"
++        elif (isinstance(__match_val, (list, tuple)) and len(__match_val) == 2 and __match_val[1] == "application/json") and isinstance(body, str):
++            body_out = body.encode("utf-8")
++            content_type_out = "application/json"
++        elif isinstance(__match_val, (list, tuple)) and len(__match_val) == 2 and __match_val[1] == "application/json":
++            body_out = json.dumps(body, allow_nan=False, indent=4).encode("utf-8")
++            content_type_out = "application/json"
++        elif (isinstance(__match_val, (list, tuple)) and len(__match_val) == 2 and __match_val[1] is None) and isinstance(body, str):
++            body_out = body.encode("utf-8")
++            content_type_out = "text/plain; charset=utf-8"
++        elif (isinstance(__match_val, (list, tuple)) and len(__match_val) == 2 and __match_val[1] is None) and isinstance(body, (dict, list)):
++            body_out = json.dumps(body, allow_nan=False, indent=4).encode("utf-8")
++            content_type_out = "application/json"
++        elif isinstance(__match_val, (list, tuple)) and len(__match_val) == 2:
++            body_out = body
++            content_type_out = content_type
  
-@@ -248,7 +252,7 @@ class Controller:
+         return (body_out, content_type_out)
+ 
+@@ -314,7 +314,7 @@ class Controller:
          self,
          code: int = 200,
          status: Optional[str] = None,
 -        data: Optional[JSONObjectConvertible | JSONArrayConvertible] = None,
 +        data: Optional[Union[JSONObjectConvertible, JSONArrayConvertible]] = None,
+         suppress_jsonapi_error: bool = False,
+         suppress_version_error: bool = False,
      ) -> None:
-         """Converts a Python data structure to JSON and wraps it in the following boilerplate JSON object which is
-         returned by all v2 endpoints:
-diff --git a/tox.ini b/tox.ini
-index 031ac54..ce3974c 100644
---- a/tox.ini
-+++ b/tox.ini
-@@ -51,3 +51,13 @@ commands = black --diff ./keylime ./test
- deps =
-     isort
- commands = isort --diff --check ./keylime ./test
-+
-+
-+[testenv:pylint39]
-+basepython = python3.9
-+deps =
-+    -r{toxinidir}/requirements.txt
-+    -r{toxinidir}/test-requirements.txt
-+    pylint
-+commands = bash scripts/check_codestyle.sh
-+allowlist_externals = bash
+@@ -528,7 +528,7 @@ class Controller:
+         """
+         if not self._form_params:
+             content_type = self.request_headers.get("Content-Type")
+-            form_params: Mapping[str, Union[str, bytes, Sequence[str | bytes]]] = {}
++            form_params: Mapping[str, Union[str, bytes, Sequence[Union[str, bytes]]]] = {}
+ 
+             if content_type and content_type.startswith("application/x-www-form-urlencoded"):
+                 form_params = Controller.decode_url_query(self.request_body)
+diff --git a/keylime/web/base/route.py b/keylime/web/base/route.py
+index b49a603..dc2b771 100644
+--- a/keylime/web/base/route.py
++++ b/keylime/web/base/route.py
+@@ -1,6 +1,6 @@
+ import re
+ from inspect import iscoroutinefunction
+-from typing import TYPE_CHECKING, Any, Mapping, Optional
++from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
+ from urllib.parse import urljoin, urlparse, urlunparse
+ 
+ import keylime.web.base as base  # pylint: disable=consider-using-from-import  # Avoid circular import
+@@ -238,7 +238,7 @@ class Route:
+         # pylint: disable=no-else-raise
+ 
+         pattern_segments = Route.split_path(self.pattern)
+-        parsed_pattern: list[str | dict[str, str]] = []
++        parsed_pattern: list[Union[str, dict[str, str]]] = []
+ 
+         for segment in pattern_segments:
+             delimiter_count = segment.count(":")
+diff --git a/keylime/web/base/server.py b/keylime/web/base/server.py
+index fe9ccbf..9ac3a3c 100644
+--- a/keylime/web/base/server.py
++++ b/keylime/web/base/server.py
+@@ -4,7 +4,7 @@ import signal
+ from abc import ABC, abstractmethod
+ from functools import wraps
+ from ssl import CERT_OPTIONAL
+-from typing import TYPE_CHECKING, Any, Callable, Optional
++from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+ 
+ import tornado
+ 
+@@ -202,7 +202,7 @@ class Server(ABC):
+         """
+         # Set defaults for server options
+         self.__component: str = "unknown"  # Component name (e.g., "verifier", "registrar")
+-        self.__config_component: str | None = None
++        self.__config_component: Union[str, None] = None
+         self.__operating_mode = None
+         self.__bind_interface: str = "127.0.0.1"
+         self.__http_port: Optional[int] = 80
+@@ -477,27 +477,31 @@ class Server(ABC):
+         if "fallback" in kwargs:
+             del kwargs["fallback"]
+ 
+-        match kwargs:
+-            case {"value": value}:
+-                pass
+-
+-            case {"from_config": config_name} if isinstance(config_name, str):
+-                value = config.get(self.config_component, config_name, fallback=fallback)  # type: ignore
+-
+-            case {"from_config": (config_name, data_type)} if data_type is str:
+-                value = config.get(self.config_component, config_name, fallback=fallback)  # type: ignore
+-
+-            case {"from_config": (config_name, data_type)} if data_type is int:
+-                value = config.getint(self.config_component, config_name, fallback=fallback)  # type: ignore
+-
+-            case {"from_config": (config_name, data_type)} if data_type is float:
+-                value = config.getfloat(self.config_component, config_name, fallback=fallback)  # type: ignore
+-
+-            case {"from_config": (config_name, data_type)} if data_type is bool:
+-                value = config.getboolean(self.config_component, config_name, fallback=fallback)  # type: ignore
+-
+-            case _:
+-                raise TypeError(f"invalid arguments given when setting option '{name}' for {self.__class__.__name__}")
++        __match_val = kwargs
++        if isinstance(__match_val, dict) and "value" in __match_val:
++            value = __match_val["value"]
++            pass
++        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and isinstance(__match_val["from_config"], str):
++            config_name = __match_val["from_config"]
++            value = config.get(self.config_component, config_name, fallback=fallback)  # type: ignore
++        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] is str:
++            config_name = __match_val["from_config"][0]
++            data_type = __match_val["from_config"][1]
++            value = config.get(self.config_component, config_name, fallback=fallback)  # type: ignore
++        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] is int:
++            config_name = __match_val["from_config"][0]
++            data_type = __match_val["from_config"][1]
++            value = config.getint(self.config_component, config_name, fallback=fallback)  # type: ignore
++        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] is float:
++            config_name = __match_val["from_config"][0]
++            data_type = __match_val["from_config"][1]
++            value = config.getfloat(self.config_component, config_name, fallback=fallback)  # type: ignore
++        elif (isinstance(__match_val, dict) and "from_config" in __match_val) and __match_val["from_config"][1] is bool:
++            config_name = __match_val["from_config"][0]
++            data_type = __match_val["from_config"][1]
++            value = config.getboolean(self.config_component, config_name, fallback=fallback)  # type: ignore
++        else:
++            raise TypeError(f"invalid arguments given when setting option '{name}' for {self.__class__.__name__}")
+ 
+         setattr(self, attr_name, value or fallback)
+ 
+diff --git a/test/test_authorization_integration.py b/test/test_authorization_integration.py
+index 698c8ae..aa466af 100644
+--- a/test/test_authorization_integration.py
++++ b/test/test_authorization_integration.py
+@@ -17,6 +17,7 @@ from keylime.authorization.provider import Action, AuthorizationRequest, Authori
+ from keylime.models.base.types import Timestamp
+ from keylime.shared_data import cleanup_global_shared_memory, get_shared_memory
+ from keylime.web.base.action_handler import ActionHandler
++from typing import Union
+ 
+ 
+ class TestIdentityExtraction(unittest.TestCase):
+@@ -32,7 +33,7 @@ class TestIdentityExtraction(unittest.TestCase):
+         """Clean up after tests."""
+         cleanup_global_shared_memory()
+ 
+-    def _create_handler_with_auth_header(self, auth_header: str | None) -> ActionHandler:
++    def _create_handler_with_auth_header(self, auth_header: Union[str, None]) -> ActionHandler:
+         """Create a mock ActionHandler with specified Authorization header."""
+         handler = ActionHandler.__new__(ActionHandler)
+         handler.request = MagicMock()
+@@ -229,12 +230,12 @@ class TestAuthorizationCheckFlow(unittest.TestCase):
+ 
+     def _create_handler_with_route(
+         self,
+-        auth_header: str | None = None,
+-        mtls_cn: str | None = None,
++        auth_header: Union[str, None] = None,
++        mtls_cn: Union[str, None] = None,
+         requires_auth: bool = True,
+         route_method: str = "GET",
+         route_pattern: str = "/agents",
+-        auth_action: Action | None = None,
++        auth_action: Union[Action, None] = None,
+     ) -> ActionHandler:
+         """Create a mock ActionHandler with specified route and auth."""
+         handler = ActionHandler.__new__(ActionHandler)
 -- 
-2.47.1
+2.54.0
 
